@@ -87,6 +87,37 @@ class SearchRequest(BaseModel):
     top_k: int = 10
 
 
+class SearchByTextRequest(BaseModel):
+    """Search by text: we embed the text into a vector, then run vector search (cosine similarity)."""
+    query: str
+    top_k: int = 5
+
+
+# --- Text → vector (for search-by-text). Uses CLIP text encoder; 512-dim to match CLIP image embeddings. ---
+
+_clip_model = None
+
+
+def _get_clip_model():
+    """Lazy-load CLIP (ViT-B/32) for text encoding. 512 dimensions."""
+    global _clip_model
+    if _clip_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            _clip_model = SentenceTransformer("sentence-transformers/clip-ViT-B-32")
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"CLIP model load failed: {e}")
+    return _clip_model
+
+
+def _embed_text(text: str) -> List[float]:
+    """Turn query text into a 512-dim vector using CLIP text encoder. Matches CLIP image embeddings."""
+    model = _get_clip_model()
+    text = (text or " ").strip()
+    vec = model.encode(text, convert_to_numpy=True)
+    return vec.tolist()
+
+
 # --- Optional API key (if API_KEY is set in .env, upload/search require X-API-Key header) ---
 
 def _require_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
@@ -194,6 +225,34 @@ def search_vectors(req: SearchRequest, x_api_key: Optional[str] = Header(None, a
         if "vector" in err.lower() or "index" in err.lower() or "dimension" in err.lower():
             raise HTTPException(status_code=400, detail=f"{err} (Check: vector length must match your index numDimensions, e.g. 5)")
         raise HTTPException(status_code=400, detail=err)
+
+
+@app.post("/search/by-text")
+def search_by_text(
+    body: SearchByTextRequest,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+):
+    """
+    Search by text: (1) embed the text with CLIP text encoder (512-dim), (2) run vector search (cosine similarity), (3) return top_k results.
+    Matches CLIP image embeddings from Modal. Your Atlas index must be 512 dimensions.
+    """
+    _require_api_key(x_api_key)
+    # 1. Text → vector (model processes the text)
+    query_vector = _embed_text(body.query)
+    # 2. Compare with DB (cosine similarity in Atlas) and get top_k
+    results = search(query_vector, top_k=body.top_k)
+    # 3. Return top 5 (or top_k) with time, title, score (cosine similarity)
+    out = []
+    for doc in results:
+        d = dict(doc)
+        d["_id"] = str(d.get("_id", ""))
+        if "embedding" in d and len(d["embedding"]) > 20:
+            d["embedding"] = d["embedding"][:10] + ["..."]
+        # Expose score as cosine_similarity so it's explicit
+        if "score" in d:
+            d["cosine_similarity"] = d["score"]
+        out.append(d)
+    return {"ok": True, "query": body.query, "top_k": body.top_k, "results": out}
 
 
 if __name__ == "__main__":
