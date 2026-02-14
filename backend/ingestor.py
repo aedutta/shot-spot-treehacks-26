@@ -10,7 +10,7 @@ MODEL_REVISION = "e9734e622b7c6225a6e872d825c342f7734892c9"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg", "locales")
+    .apt_install("ffmpeg", "locales", "nodejs")
     .run_commands(
         "sed -i '/^#\\s*en_US.UTF-8 UTF-8/ s/^#//' /etc/locale.gen",
         "locale-gen en_US.UTF-8",
@@ -21,7 +21,7 @@ image = (
         "torch==2.5.1",
         "transformers==4.47.1",
         "huggingface-hub==0.36.0",
-        "yt-dlp==2024.12.23",
+        "yt-dlp",
         "pillow==11.0.0",
         "numpy<2.0.0",
     )
@@ -62,10 +62,14 @@ class VideoIngestor:
         import yt_dlp
         from PIL import Image
         
-        with yt_dlp.YoutubeDL({"format": "best[ext=mp4]", "quiet": True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            stream_url = info['url']
-            self.current_title = info.get('title', 'Unknown')
+        try:
+            with yt_dlp.YoutubeDL({"format": "best", "quiet": True, "noplaylist": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                stream_url = info['url']
+                self.current_title = info.get('title', 'Unknown')
+        except Exception as e:
+            print(f"❌ Error getting stream for {url}: {e}")
+            return
 
         cmd = [
             "ffmpeg", "-i", stream_url,
@@ -111,6 +115,7 @@ class VideoIngestor:
         return results
     
     def _embed_batch(self, frames, timestamps):
+        import torch
         inputs = self.processor(images=frames, return_tensors="pt", padding=True).to(self.device)
         with torch.no_grad():
             emb = self.model.get_image_features(**inputs)

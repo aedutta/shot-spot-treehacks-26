@@ -1,1 +1,9 @@
 modal
+opencv-python
+torch
+torchvision
+huggingface-hub
+transformers
+yt-dlp
+pillow
+numpy
