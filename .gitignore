@@ -7,3 +7,4 @@ __pycache__/
 backend/__pycache__/
 .env
 logs/
+app\frontend\node_modules
