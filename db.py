@@ -17,16 +17,26 @@ from pymongo import MongoClient
 from pymongo.database import Database
 from pymongo.collection import Collection
 
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
-def get_client(uri: Union[str, None] = None) -> MongoClient:
-    """Create and return a MongoDB client."""
+
+def get_client(uri: Union[str, None] = None, server_selection_timeout_ms: Union[int, None] = None) -> MongoClient:
+    """Create and return a MongoDB client. Optional server_selection_timeout_ms to avoid long hangs (e.g. 5000)."""
     uri = (uri or os.environ.get("MONGODB_URI", "mongodb://localhost:27017")).strip().strip('"\'')
     if not (uri.startswith("mongodb://") or uri.startswith("mongodb+srv://")):
         raise ValueError(
             "MONGODB_URI must start with 'mongodb://' or 'mongodb+srv://'. "
             "Check your .env — e.g. MONGODB_URI=mongodb+srv://USERNAME:PASSWORD@host.mongodb.net/"
         )
-    return MongoClient(uri)
+    kwargs = {}
+    if certifi is not None and "mongodb+srv://" in uri:
+        kwargs["tlsCAFile"] = certifi.where()
+    if server_selection_timeout_ms is not None:
+        kwargs["serverSelectionTimeoutMS"] = server_selection_timeout_ms
+    return MongoClient(uri, **kwargs)
 
 
 def get_db(client: Union[MongoClient, None] = None, db_name: Union[str, None] = None) -> Database:

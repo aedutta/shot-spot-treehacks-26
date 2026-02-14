@@ -26,7 +26,7 @@ This project is **vector-based**: search uses only Atlas Vector Search. Create t
 }
 ```
 
-**Important:** Set `numDimensions` to your embedding size. For `test_db.py` use **5**. For real encoders use e.g. `384`, `512`, `768`, `1536`.
+**Important:** Set `numDimensions` to your embedding size. **CLIP ViT-B/32 (Modal VideoIngestor) → 512.** For tests use **5**. Other models: `384`, `768`, `1536`.
 
 8. Create the index. It may take a few minutes to build.
 
