@@ -1,143 +1,218 @@
 import modal
 import os
-import subprocess
-import time
-from pathlib import Path
+import asyncio
 
+# Configuration
 CACHE_DIR = "/cache"
 MODEL_REPO = "openai/clip-vit-base-patch32"
-MODEL_REVISION = "e9734e622b7c6225a6e872d825c342f7734892c9"
+SEGMENT_DURATION = 60  
 
+# 1. Define Image with Baked-in Model + Node.js + Cookies
+def download_model_build_step():
+    from transformers import CLIPProcessor, CLIPModel
+    import os
+    os.environ["HF_HUB_CACHE"] = CACHE_DIR
+    print(f"🏗️ Baking {MODEL_REPO} into image...")
+    CLIPProcessor.from_pretrained(MODEL_REPO)
+    CLIPModel.from_pretrained(MODEL_REPO)
+
+# Base Image
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg", "locales", "nodejs")
-    .run_commands(
-        "sed -i '/^#\\s*en_US.UTF-8 UTF-8/ s/^#//' /etc/locale.gen",
-        "locale-gen en_US.UTF-8",
-        "update-locale LANG=en_US.UTF-8",
-    )
-    .env({"LANG": "en_US.UTF-8", "HF_HUB_CACHE": CACHE_DIR})
-    .uv_pip_install(
+    .apt_install("ffmpeg", "git", "nodejs", "npm") 
+    .pip_install(
         "torch==2.5.1",
         "transformers==4.47.1",
-        "huggingface-hub==0.36.0",
         "yt-dlp",
-        "pillow==11.0.0",
-        "numpy<2.0.0",
+        "pillow",
+        "requests",
+        "numpy"
     )
+    .env({"HF_HUB_CACHE": CACHE_DIR})
+    .run_function(download_model_build_step)
 )
 
-model_cache = modal.Volume.from_name("treehacks-model-cache", create_if_missing=True)
+# 2. Define the Cookie Mount (Runtime injection instead of build-time)
+cookie_mount = modal.Mount.from_local_file("cookies.txt", remote_path="/root/cookies.txt") if os.path.exists("cookies.txt") else None
+params = {"mounts": [cookie_mount]} if cookie_mount else {}
 
-app = modal.App("treehacks-video-ingestor", image=image)
+app = modal.App("treehacks-video-ingestor-v2", image=image)
 
-@app.function(volumes={CACHE_DIR: model_cache})
-def download_model():
-    from huggingface_hub import snapshot_download
-    print(f"Downloading {MODEL_REPO}...")
-    snapshot_download(MODEL_REPO, revision=MODEL_REVISION, cache_dir=CACHE_DIR)
-    print("✅ Model downloaded and cached.")
-
+# 2. Worker Class
 @app.cls(
-    gpu="H100", 
-    volumes={CACHE_DIR: model_cache}, 
-    max_containers=10,       
-    scaledown_window=300
+    gpu="A10G", 
+    scaledown_window=120,
+    secrets=[modal.Secret.from_name("mongo")],
+    **params  # Mount cookies at runtime
 )
-@modal.concurrent(max_inputs=4)
-class VideoIngestor:
+class VideoWorker:
     @modal.enter()
     def load_model(self):
-        """Loads model into VRAM once per container."""
         import torch
         from transformers import CLIPProcessor, CLIPModel
+        
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"⚡ Loading CLIP on {self.device}...", flush=True)
+        
+        self.processor = CLIPProcessor.from_pretrained(MODEL_REPO, local_files_only=True)
+        self.model = CLIPModel.from_pretrained(MODEL_REPO, local_files_only=True).to(self.device)
+        self.model.eval() 
+        print("✅ Model ready.")
 
-        self.device = "cuda"
-        print("⚡ Loading CLIP model...")
-        self.processor = CLIPProcessor.from_pretrained(MODEL_REPO, cache_dir=CACHE_DIR)
-        self.model = CLIPModel.from_pretrained(MODEL_REPO, cache_dir=CACHE_DIR).to(self.device)
-        print("✅ Model loaded.")
-
-    def _stream_frames(self, url, fps):
+    def _get_stream_url(self, url):
         import yt_dlp
+        # Use cookies.txt if available
+        ydl_opts = {
+            "format": "best", 
+            "quiet": True,
+            "cookiefile": "/root/cookies.txt" if os.path.exists("/root/cookies.txt") else None
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info['url']
+
+    @modal.method()
+    def process_segment(self, video_url: str, start: float, end: float, title: str, fps: int = 1):
+        import subprocess
         from PIL import Image
+        import torch
+        
+        print(f"▶️ Segment {start}-{end}s: {title}", flush=True)
         
         try:
-            with yt_dlp.YoutubeDL({"format": "best", "quiet": True, "noplaylist": True}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                stream_url = info['url']
-                self.current_title = info.get('title', 'Unknown')
+            stream_url = self._get_stream_url(video_url)
         except Exception as e:
-            print(f"❌ Error getting stream for {url}: {e}")
-            return
+            print(f"❌ Failed to get stream for {video_url}. (Check cookies.txt): {e}")
+            return 0
 
+        # FFMPEG: Seek to specific time (-ss) and duration (-t)
         cmd = [
-            "ffmpeg", "-i", stream_url,
+            "ffmpeg", 
+            "-ss", str(start),
+            "-t", str(end - start),
+            "-i", stream_url,
             "-vf", f"fps={fps},scale=224:224",
             "-f", "image2pipe",
             "-pix_fmt", "rgb24",
-            "-vcodec", "rawvideo", "-"
+            "-vcodec", "rawvideo", 
+            "-loglevel", "error",
+            "-"
         ]
-        
+
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         frame_bytes = 224 * 224 * 3
         
+        frames = []
+        timestamps = []
+        frame_idx = 0
+
         while True:
             raw = process.stdout.read(frame_bytes)
             if len(raw) != frame_bytes: break
-            yield Image.frombytes("RGB", (224, 224), raw)
-        
-        process.terminate()
-    
-    @modal.method()
-    def process_stream(self, url: str, fps: int = 1, batch_size: int = 32):
-        import torch
-        
-        print(f"▶️ Processing: {url}")
-        results = []
-        batch_frames = []
-        batch_timestamps = []
-        frame_idx = 0
-
-        for frame in self._stream_frames(url, fps):
-            batch_frames.append(frame)
-            batch_timestamps.append(frame_idx / fps)
+            
+            image = Image.frombytes("RGB", (224, 224), raw)
+            frames.append(image)
+            timestamps.append(start + (frame_idx / fps))
             frame_idx += 1
-            
-            if len(batch_frames) >= batch_size:
-                results.extend(self._embed_batch(batch_frames, batch_timestamps))
-                batch_frames, batch_timestamps = [], []
 
-        if batch_frames:
-            results.extend(self._embed_batch(batch_frames, batch_timestamps))
-            
-        print(f"✅ Finished {self.current_title}: {len(results)} vectors.")
-        return results
-    
-    def _embed_batch(self, frames, timestamps):
-        import torch
+        process.terminate()
+
+        if not frames:
+            return 0
+
+        # Batch Inference
+        print(f"🧠 Embedding {len(frames)} frames...", flush=True)
         inputs = self.processor(images=frames, return_tensors="pt", padding=True).to(self.device)
+        
         with torch.no_grad():
             emb = self.model.get_image_features(**inputs)
             emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
-            
-        return [
-            {"time": t, "vector": v.tolist(), "title": self.current_title}
+
+        # STRICT API MATCH: Only sending time, vector, title
+        results = [
+            {"time": t, "vector": v.tolist(), "title": title, "source": video_url}
             for t, v in zip(timestamps, emb.cpu())
         ]
 
+        self._push_results(results)
+        return len(results)
+
+    def _push_results(self, vectors):
+        import requests
+        if not vectors: return
+        
+        api_url = os.environ.get("VECTOR_API_URL")
+        api_key = os.environ.get("VECTOR_API_KEY")
+        
+        if not api_url:
+            print("⚠️ VECTOR_API_URL missing. Skipping upload.")
+            return
+
+        try:
+            # Modified to use /frames/bulk for flexibility
+            url = api_url.rstrip("/") + "/frames/bulk"
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["X-API-Key"] = api_key
+
+            resp = requests.post(
+                url, 
+                json={"frames": vectors}, 
+                headers=headers,
+                timeout=15
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"❌ Upload failed: {e}")
+
+# 3. Orchestrator
+@app.function(image=image, **params)
+def ingest_video_orchestrator(url: str):
+    import yt_dlp
+    
+    print(f"🔎 Analyzing {url}...")
+    
+    ydl_opts = {
+        "quiet": True, 
+        "cookiefile": "/root/cookies.txt" if os.path.exists("/root/cookies.txt") else None
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=False)
+            duration = info.get('duration')
+            title = info.get('title', 'Unknown')
+            if not duration:
+                print(f"❌ Could not determine duration for {url}")
+                return
+        except Exception as e:
+            print(f"❌ Metadata fetch failed: {e}")
+            print("💡 TIP: Ensure 'cookies.txt' is in your local folder to bypass YouTube login checks.")
+            return
+
+    print(f"🎞️ Title: {title} | Duration: {duration}s")
+    
+    segments = []
+    for t in range(0, duration, SEGMENT_DURATION):
+        end = min(t + SEGMENT_DURATION, duration)
+        segments.append((url, t, end, title))
+
+    print(f"🚀 Launching {len(segments)} parallel workers...")
+    
+    worker = VideoWorker()
+    results = list(worker.process_segment.starmap(segments))
+    
+    total_frames = sum(results)
+    print(f"✅ Completed {title}: Processed {total_frames} frames.")
+
 @app.local_entrypoint()
 def main():
+    if not os.path.exists("cookies.txt"):
+        print("⚠️ WARNING: cookies.txt not found. YouTube may block the request.")
+    
     urls = [
-        "https://youtu.be/dQw4w9WgXcQ?si=CqbeYpdLFPf9mZ4T",
-        "https://youtu.be/Aq5WXmQQooo?si=XYiwlQ5kjf0MfbZW",
+        "https://www.twitch.tv/videos/2689445480"
     ]
     
-    print("🚀 Launching concurrent ingestion...")
-    ingestor = VideoIngestor()
-    results = list(ingestor.process_stream.map(urls))
-    print(f"Processed {len(results)} videos.")
-
-if __name__ == "__main__":
-    with app.run():
-        main()
+    for url in urls:
+        ingest_video_orchestrator.remote(url)
