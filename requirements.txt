@@ -3,6 +3,7 @@ numpy>=1.24.0
 python-dotenv>=1.0.0
 certifi
 fastapi>=0.100.0
+requests
 # Removed heavy/unused libs for Vercel
 modal
 # uvicorn is provided by Vercel runtime or unnecessary 
