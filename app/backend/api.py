@@ -41,8 +41,9 @@ except ImportError:
 try:
     from transformers import CLIPProcessor, CLIPModel
     import torch
-    print("Loading CLIP (Text Encoder)...")
-    model_id = "openai/clip-vit-base-patch32"
+    print("Loading CLIP (Text Encoder - LAION-2B)...")
+    # Using LAION-2B (English) - Drop-in replacement for OpenAI ViT-B/32 (512 dim)
+    model_id = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
     processor = CLIPProcessor.from_pretrained(model_id)
     model = CLIPModel.from_pretrained(model_id)
     print("CLIP Loaded.")
@@ -239,12 +240,28 @@ def search_frames(req: SearchRequest):
 
         results = search(vector, top_k=req.top_k, filter_query=filter_q)
     except Exception as e:
-        print(f"DB Search failed: {e}")
-        return {"ok": False, "error": str(e)}
+        error_msg = str(e)
+        # Handle missing index configuration gracefully
+        if "needs to be indexed as filter" in error_msg:
+            print("⚠️ CRITICAL WARNING: MongoDB Atlas Index is missing the 'filter' definition.")
+            print("   Falling back to UNFILTERED search so the app works.")
+            print("   ACTION REQUIRED: Add {'type': 'filter', 'path': 'source'} to your Atlas Search Index.")
+            
+            # Fallback: Retry without the filter
+            results = search(vector, top_k=req.top_k, filter_query=None)
+        else:
+            print(f"DB Search failed: {e}")
+            return {"ok": False, "error": str(e)}
         
     # 3. Format for Frontend
     formatted = []
     for doc in results:
+        # Filter out low relevance scores (Noise reduction)
+        # Cosine similarity for CLIP usually effectively ranges 0.2-0.3 for good matches
+        score = doc.get("score", 0)
+        if score < 0.22: 
+            continue
+            
         # doc has: embedding, time, title, source, score (from search)
         
         # Calculate pretty timestamp

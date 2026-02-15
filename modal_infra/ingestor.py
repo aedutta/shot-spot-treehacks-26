@@ -33,9 +33,6 @@ image = (
     .run_function(download_model_build_step)
 )
 
-# 2. Define the Cookie Mount (Runtime injection instead of build-time)
-cookie_mount = modal.Mount.from_local_file("cookies.txt", remote_path="/root/cookies.txt") if os.path.exists("cookies.txt") else None
-params = {"mounts": [cookie_mount]} if cookie_mount else {}
 
 app = modal.App("treehacks-video-ingestor-v2", image=image)
 
@@ -43,8 +40,7 @@ app = modal.App("treehacks-video-ingestor-v2", image=image)
 @app.cls(
     gpu="A10G", 
     scaledown_window=120,
-    secrets=[modal.Secret.from_name("mongo")],
-    **params  # Mount cookies at runtime
+    secrets=[modal.Secret.from_name("mongo")]
 )
 class VideoWorker:
     @modal.enter()
@@ -66,7 +62,7 @@ class VideoWorker:
         # Check for cookies (Uploaded to /root/cookies.txt via Mount)
         cookie_path = "/root/cookies.txt"
         if not os.path.exists(cookie_path):
-             print(f"⚠️ MISSING COOKIES: {cookie_path} not found. YouTube will likely block this.", flush=True)
+             print(f"ℹ️ No cookies found. Using Android/iOS client spoofing to bypass login.", flush=True)
              cookie_path = None
         else:
              print(f"🍪 FOUND COOKIES: Using {cookie_path} for authentication.", flush=True)
@@ -185,7 +181,7 @@ class VideoWorker:
             print(f"❌ Upload failed: {e}")
 
 # 3. Orchestrator
-@app.function(image=image, **params)
+@app.function(image=image)
 def ingest_video_orchestrator(url: str):
     import yt_dlp
     

@@ -101,6 +101,7 @@ export default function Dashboard() {
   // Handle Start
   const handleStart = async () => {
     setIsIngesting(true);
+    setFrames([]); // Clear old frames immediately
     addLog(`INITIALIZING CLUSTER...`);
     addLog(`Source: ${source} | URL: ${url || "Default"} | Target: "${prompt}"`);
     addLog(`Scaling to ${scale} workers on A10G GPUs...`);
@@ -121,10 +122,23 @@ export default function Dashboard() {
            addLog(`✅ SUCCESS: ${res.data.message}`);
            addLog(`🆔 JOB ID: ${res.data.job_id}`);
            
-           // Only start fetching frames if successful
-           setTimeout(() => {
-              fetchFrames();
-           }, 3000);
+           addLog(`⏳ WAITING FOR FIRST BATCH...`);
+           
+           // Wait until we actually have some data
+           const checkDataInterval = setInterval(async () => {
+              try {
+                // Poll for at least one result
+                const payload = { query: prompt, top_k: 1, source_url: url || undefined };
+                const checkRes = await axios.post("http://localhost:8000/search", payload);
+                if (checkRes.data.ok && checkRes.data.results.length > 0) {
+                    clearInterval(checkDataInterval);
+                    addLog(`🚀 DATA STREAM ACTIVE - STARTING VISUALIZATION`);
+                    fetchFrames(); // Initial fetch
+                }
+              } catch (e) {
+                // Keep waiting
+              }
+           }, 2000);
 
         } else {
            addLog(`⚠️ CRITICAL FAILURE: ${res.data.message}`);
@@ -232,9 +246,17 @@ export default function Dashboard() {
                     setUrl(val);
                     
                     // Auto-detect Source
+                    const isSupported = (
+                        val.includes("youtube.com") || val.includes("youtu.be") || 
+                        val.includes("twitch.tv") || val.includes("tiktok.com") ||
+                        val.includes("vimeo.com") || val.includes("dailymotion.com") ||
+                        val.includes("facebook.com")
+                    );
+                    
                     if (val.includes("youtube.com") || val.includes("youtu.be")) setSource("Youtube");
                     else if (val.includes("twitch.tv")) setSource("Twitch");
                     else if (val.includes("tiktok.com")) setSource("TikTok");
+                    else if (isSupported) setSource("Generic");
                     else setSource("Unknown");
                   }}
                   placeholder="e.g. YouTube / Twitch URL"

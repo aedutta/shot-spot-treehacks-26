@@ -20,13 +20,23 @@ This project is **vector-based**: search uses only Atlas Vector Search. Create t
     {
       "type": "vector",
       "path": "embedding",
-      "numDimensions": 5
+      "numDimensions": 512,
+      "similarity": "cosine"
+    },
+    {
+      "type": "filter",
+      "path": "source"
     }
   ]
 }
 ```
 
-**Important:** Set `numDimensions` to your embedding size. **CLIP ViT-B/32 (Modal VideoIngestor) → 512.** For tests use **5**. Other models: `384`, `768`, `1536`.
+**Important:** 
+1. `numDimensions` MUST be **512** for CLIP ViT-B/32.
+2. The `source` filter field is REQUIRED to prevent searching across multiple videos.
+
+# Troubleshooting
+- **Seeing old video clips?** You likely forgot to add the `source` filter block to your Atlas Search Index definition. Without it, the `filter` in the query is silently ignored.
 
 8. Create the index. It may take a few minutes to build.
 
