@@ -14,6 +14,9 @@ load_dotenv(os.path.join(project_root, ".env"))
 modal_folder = os.path.join(project_root, "modal_infra")
 if modal_folder not in sys.path:
     sys.path.append(modal_folder)
+# Add project root for time_stamp_grouping
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,6 +38,11 @@ except ImportError:
     # If not in path, try adding root
     sys.path.append(project_root)
     from db import get_collection, search
+
+try:
+    from time_stamp_grouping import get_timestamps as get_timestamp_segments
+except ImportError:
+    get_timestamp_segments = None
 
 # --- CLIP Model (Text Only) ---
 # We load a small CLIP model to embed text queries for search
@@ -281,14 +289,37 @@ def search_frames(req: SearchRequest):
         # Use a placeholder or frame extraction service for the actual image
         formatted.append({
             "id": str(doc.get("_id")),
-            "url": f"https://source.unsplash.com/random/300x200?sig={random.randint(0,1000)}", 
+            "url": f"https://source.unsplash.com/random/300x200?sig={random.randint(0,1000)}",
             "timestamp": time_str,
+            "timestamp_seconds": int(ts),
             "score": doc.get("score", 0),
             "source_url": link,
             "title": doc.get("title", "Unknown")
         })
-        
+
     return {"ok": True, "results": formatted}
+
+
+class GroupTimestampsRequest(BaseModel):
+    times: List[float]
+    video_length: int
+
+
+@app.post("/timestamps/group")
+def group_timestamps(body: GroupTimestampsRequest):
+    """Merge nearby inference timestamps into segments; returns segment start times (for sidebar candidates)."""
+    if get_timestamp_segments is None:
+        return {"ok": False, "error": "time_stamp_grouping not available", "starts": []}
+    try:
+        # Clamp times to valid range to avoid index errors
+        times = [max(0, min(int(t), body.video_length - 1)) for t in body.times]
+        if not times:
+            return {"ok": True, "segments": [], "starts": []}
+        segments = get_timestamp_segments(times, body.video_length)
+        starts = [s for s, _ in segments]
+        return {"ok": True, "segments": segments, "starts": starts}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "starts": []}
 
 @app.post("/ingest/start")
 async def start_ingest(source_url: str, prompt: str, scale: int = 10, stealth: bool = False):
