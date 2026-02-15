@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { 
   Terminal, Activity, Radio, Cpu, Download, 
   Search, Shield, Zap, Database, Play, Pause,
-  Globe, Video, Layers, AlertCircle
+  Globe, Video, Layers, AlertCircle, X
 } from "lucide-react";
 import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import axios from "axios";
@@ -15,6 +15,30 @@ import { twMerge } from "tailwind-merge";
 // --- Utils ---
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+/** Build embed URL for Twitch/YouTube to start at given timestamp (seconds). */
+function embedUrlForSource(sourceUrl: string, startSeconds: number): string | null {
+  try {
+    if (sourceUrl.includes("twitch.tv")) {
+      const m = sourceUrl.match(/twitch\.tv\/videos\/(\d+)/);
+      if (m) {
+        const videoId = m[1];
+        const parent = typeof window !== "undefined" ? window.location.hostname : "localhost";
+        return `https://player.twitch.tv/?video=${videoId}&t=${startSeconds}s&parent=${parent}`;
+      }
+    }
+    if (sourceUrl.includes("youtube.com") || sourceUrl.includes("youtu.be")) {
+      const m = sourceUrl.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]+)/);
+      if (m) {
+        const videoId = m[1];
+        return `https://www.youtube.com/embed/${videoId}?start=${Math.floor(startSeconds)}`;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 // --- Mock Data Generator ---
@@ -46,6 +70,13 @@ export default function Dashboard() {
   const [termSearch, setTermSearch] = useState("");
   const [isTermExpanded, setIsTermExpanded] = useState(false);
   const termRef = useRef<HTMLDivElement>(null);
+
+  // PiP overlay: video over cluster starting at frame timestamp
+  const [pipFrame, setPipFrame] = useState<{
+    source_url: string;
+    timestamp_seconds?: number;
+    title: string;
+  } | null>(null);
 
   // --- Effects ---
   
@@ -162,26 +193,65 @@ export default function Dashboard() {
   };
 
   const fetchFrames = async () => {
-    // In a real app, this hits the API. Here we mock it or hit our local backend.
     try {
       const payload = {
          query: prompt, 
          top_k: 12,
-         source_url: url || undefined // Filter by this specific video if provided
+         source_url: url || undefined
       };
       
       const res = await axios.post("http://localhost:8000/search", payload);
       if (res.data.ok) {
-        setFrames(res.data.results);
-        addLog(`DATASET UPDATE: Found ${res.data.results.length} new samples matching "${prompt}"`);
+        const results = res.data.results as Array<{ timestamp_seconds?: number; [k: string]: unknown }>;
+        if (results.length === 0) {
+          setFrames([]);
+          addLog(`DATASET UPDATE: No samples matching "${prompt}"`);
+          return;
+        }
+        // Group timestamps into segments and keep only segment-start candidates for the sidebar
+        const times = results.map((r) => r.timestamp_seconds ?? 0).filter((t) => typeof t === "number");
+        const videoLength = Math.max(...times, 0) + 120;
+        try {
+          const groupRes = await axios.post("http://localhost:8000/timestamps/group", {
+            times,
+            video_length: videoLength,
+          });
+          const starts: number[] = groupRes.data?.starts ?? [];
+          if (starts.length === 0) {
+            setFrames(results);
+            addLog(`DATASET UPDATE: Found ${results.length} samples (no grouping)`);
+            return;
+          }
+          // For each segment start, pick the frame at that start (smallest timestamp_seconds >= start, or closest before)
+          const segmentStartFrames = starts.map((start) => {
+            const atOrAfter = results.filter((r) => (r.timestamp_seconds ?? 0) >= start);
+            if (atOrAfter.length > 0) {
+              return atOrAfter.reduce((a, b) => ((a.timestamp_seconds ?? 0) <= (b.timestamp_seconds ?? 0) ? a : b));
+            }
+            return results.reduce((a, b) => ((a.timestamp_seconds ?? 0) >= (b.timestamp_seconds ?? 0) ? a : b));
+          });
+          // Dedupe by id (same frame can be closest to multiple starts if sparse)
+          const seen = new Set<string>();
+          const deduped = segmentStartFrames.filter((f) => {
+            const id = String(f.id ?? f.timestamp_seconds ?? Math.random());
+            if (seen.has(id)) return false;
+            seen.add(id);
+            return true;
+          });
+          setFrames(deduped);
+          addLog(`DATASET UPDATE: ${results.length} samples → ${deduped.length} segment starts for "${prompt}"`);
+        } catch (_) {
+          setFrames(results);
+          addLog(`DATASET UPDATE: Found ${results.length} new samples matching "${prompt}"`);
+        }
       }
     } catch (e) {
-      // Fallback if backend isn't running
-      const mockFrames = Array.from({length: 12}, (_, i) => ({
+      const mockFrames = Array.from({ length: 12 }, (_, i) => ({
         id: i,
         url: `https://picsum.photos/seed/${i + Math.random()}/300/200`,
         score: (0.7 + Math.random() * 0.29).toFixed(4),
-        timestamp: "00:04:23"
+        timestamp: "00:04:23",
+        timestamp_seconds: 263 + i * 10,
       }));
       setFrames(mockFrames);
     }
@@ -459,6 +529,66 @@ export default function Dashboard() {
               )})}
             </div>
 
+            {/* PiP video overlay over cluster — starts at frame timestamp */}
+            <AnimatePresence>
+              {pipFrame && (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.95 }}
+                  transition={{ duration: 0.2 }}
+                  className="absolute inset-0 z-20 flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm"
+                  onClick={() => setPipFrame(null)}
+                >
+                  <div
+                    className="relative w-full max-w-2xl aspect-video rounded-xl overflow-hidden border-2 border-neon-green/50 bg-black shadow-2xl shadow-neon-green/20"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setPipFrame(null)}
+                      className="absolute top-2 right-2 z-30 w-8 h-8 rounded-full bg-black/80 border border-zinc-600 flex items-center justify-center text-white hover:bg-red-500 hover:border-red-500 transition-colors"
+                      aria-label="Close video"
+                    >
+                      <X size={16} />
+                    </button>
+                    <div className="absolute top-2 left-2 z-30 px-2 py-1 rounded bg-black/80 text-[10px] text-neon-green font-mono border border-neon-green/30 truncate max-w-[80%]">
+                      {pipFrame.title} · {pipFrame.timestamp_seconds != null ? `${Math.floor(pipFrame.timestamp_seconds / 60)}m ${pipFrame.timestamp_seconds % 60}s` : ""}
+                    </div>
+                    {embedUrlForSource(pipFrame.source_url, pipFrame.timestamp_seconds ?? 0) ? (
+                      <iframe
+                        src={embedUrlForSource(pipFrame.source_url, pipFrame.timestamp_seconds ?? 0) ?? ""}
+                        title={pipFrame.title}
+                        className="w-full h-full"
+                        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                        allowFullScreen
+                      />
+                    ) : (
+                      <div className="w-full h-full flex flex-col items-center justify-center gap-3 text-zinc-400 p-4">
+                        <Video size={48} className="text-zinc-600" />
+                        <span className="text-sm text-center">This source cannot be embedded. Open in a new tab to watch.</span>
+                        <a
+                          href={pipFrame.source_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-neon-green hover:underline text-sm font-bold"
+                        >
+                          Open video →
+                        </a>
+                        <button
+                          type="button"
+                          onClick={() => setPipFrame(null)}
+                          className="mt-2 text-zinc-500 hover:text-white text-xs"
+                        >
+                          Close
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
             
             {/* TERMINAL LOGS OVERLAY */}
             <div 
@@ -560,25 +690,30 @@ export default function Dashboard() {
            ) : (
              <div className="grid grid-cols-1 gap-3">
                {frames.map((frame, i) => (
-                 <motion.a 
-                    href={frame.source_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
+                 <motion.div
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setPipFrame({
+                      source_url: frame.source_url,
+                      timestamp_seconds: frame.timestamp_seconds ?? 0,
+                      title: frame.title ?? "Video",
+                    })}
+                    onKeyDown={(e) => e.key === "Enter" && setPipFrame({
+                      source_url: frame.source_url,
+                      timestamp_seconds: frame.timestamp_seconds ?? 0,
+                      title: frame.title ?? "Video",
+                    })}
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
-                    key={i} 
-                    className="group relative aspect-video bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden hover:border-neon-green transition-all cursor-pointer block"
+                    key={i}
+                    className="group relative aspect-video bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden hover:border-neon-green transition-all cursor-pointer"
                   >
-                    {/* Placeholder or Thumbnail - For Twitch/YT we rely on the placeholder for now unless we fetch real thumbs */}
-                    <img src={frame.url} className="w-full h-full object-cover opacity-60 group-hover:opacity-80 transition-opacity" />
-                    
-                    {/* Play Button Overlay */}
+                    <img src={frame.url} className="w-full h-full object-cover opacity-60 group-hover:opacity-80 transition-opacity" alt="" />
                     <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
                         <div className="w-10 h-10 bg-neon-green/90 rounded-full flex items-center justify-center shadow-lg shadow-neon-green/20 backdrop-blur-sm">
                             <Play size={18} className="text-black ml-1" fill="currentColor" />
                         </div>
                     </div>
-
                     <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black via-black/90 to-transparent p-3 pt-8">
                        <div className="flex justify-between items-end">
                           <div className="flex flex-col gap-0.5">
@@ -593,7 +728,7 @@ export default function Dashboard() {
                           </span>
                        </div>
                     </div>
-                 </motion.a>
+                 </motion.div>
                ))}
              </div>
            )}
