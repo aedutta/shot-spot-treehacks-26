@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv(os.path.join(project_root, ".env"))
 
-# Add the 'modal' folder to sys.path so we can import 'ingestor'
-modal_folder = os.path.join(project_root, "modal")
+# Add the 'modal_infra' folder to sys.path so we can import 'ingestor'
+modal_folder = os.path.join(project_root, "modal_infra")
 if modal_folder not in sys.path:
     sys.path.append(modal_folder)
 
