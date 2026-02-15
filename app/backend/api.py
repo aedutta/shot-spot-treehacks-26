@@ -521,6 +521,7 @@ def export_dataset(query: Optional[str] = None):
 # --- Endpoints ---
 
 @app.get("/")
+@app.get("/api")
 def root():
     return {"status": "ok", "message": "Ingest.ai API Operational"}
 
