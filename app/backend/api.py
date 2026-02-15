@@ -756,11 +756,14 @@ async def start_ingest(source_url: str, prompt: str, scale: int = 10, stealth: b
             "message": "❌ Please run `modal deploy modal/ingestor.py` in your terminal to deploy the function first."
         }
     except Exception as e:
+        env_vars = list(os.environ.keys())
+        token_id_ok = "MODAL_TOKEN_ID" in os.environ
+        token_secret_ok = "MODAL_TOKEN_SECRET" in os.environ
         print(f"Modal invocation failed: {e}")
         return {
             "ok": False,
             "error": str(e),
-            "message": f"Failed to trigger Modal function: {str(e)}"
+            "message": f"Failed to trigger Modal function: {str(e)} \nDEBUG INFO: MODAL_TOKEN_ID set? {token_id_ok}, MODAL_TOKEN_SECRET set? {token_secret_ok}"
         }
 
 @app.post("/ingestion/init")
