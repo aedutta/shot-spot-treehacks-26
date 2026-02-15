@@ -40,7 +40,7 @@ image = (
     .pip_install(
         "torch==2.5.1",
         "transformers==4.47.1",
-        "yt-dlp",
+        "yt-dlp[default,curl-cffi]",
         "pillow",
         "requests",
         "numpy",
@@ -61,7 +61,7 @@ def get_yt_dlp_opts(filename=None):
         "quiet": True,
         "noplaylist": True,
         "geo_bypass": True,
-        # ✨ Spoofing: Pretend to be iOS/Android to bypass bot checks (No cookies needed)
+        # Re-enable spoofing for YouTube stability, now supported by curl-cffi
         "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
     }
