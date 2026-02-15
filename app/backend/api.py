@@ -95,8 +95,10 @@ def embed_text(text: str) -> List[float]:
 app = FastAPI(
     title="ShotSpot API",
     description="Just-in-Time Dataset Factory API",
-    docs_url="/api/docs",
-    openapi_url="/api/openapi.json"
+    docs_url="/docs",
+    openapi_url="/openapi.json",
+    servers=[{"url": "/api"}],
+    root_path="/api"
 )
 
 # Allow CORS
