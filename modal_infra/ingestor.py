@@ -81,6 +81,10 @@ class VideoWorker:
     def setup(self):
         import torch
         from transformers import CLIPProcessor, CLIPModel, pipeline, AutoModelForSpeechSeq2Seq, AutoProcessor
+        import warnings
+        
+        # Suppress benign warnings from Transformers/Whisper
+        warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"⚡ Loading Models on {self.device}...", flush=True)

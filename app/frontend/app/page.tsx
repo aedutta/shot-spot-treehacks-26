@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { 
   Terminal, Activity, Radio, Cpu, Download, 
   Search, Shield, Zap, Database, Play, Pause,
-  Globe, Video, Layers, AlertCircle, X
+  Globe, Video, Layers, AlertCircle, X, Plus, Trash2
 } from "lucide-react";
 import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import axios from "axios";
@@ -77,6 +77,43 @@ export default function Dashboard() {
     timestamp_seconds?: number;
     title: string;
   } | null>(null);
+
+  // Tab State
+  const [activeTab, setActiveTab] = useState<"analyze" | "create">("analyze");
+
+  // Create Tab State
+  const [scrapeUrls, setScrapeUrls] = useState<string[]>([""]);
+  const [scrapeResults, setScrapeResults] = useState<any>(null);
+  const [isScraping, setIsScraping] = useState(false);
+  const [createPrompt, setCreatePrompt] = useState("");
+
+  const handleCreateDataset = async () => {
+    setIsScraping(true);
+    setScrapeResults(null);
+    try {
+      const validUrls = scrapeUrls.filter((u) => u.trim() !== "");
+      
+      if (!createPrompt.trim()) {
+        alert("Please describe the dataset.");
+        setIsScraping(false);
+        return;
+      }
+
+      addLog(`Starting Dataset Job: "${createPrompt}" [${validUrls.length > 0 ? validUrls.length + ' Sources' : 'Auto-Discovery'}]...`);
+      const res = await axios.post("http://localhost:8000/dataset/create", {
+        prompt: createPrompt,
+        urls: validUrls,
+      });
+
+      setScrapeResults(res.data);
+      addLog(`Dataset Job Initiated: ${JSON.stringify(res.data.message)}`);
+    } catch (e: any) {
+      addLog(`Dataset error: ${e.message}`);
+      setScrapeResults({ error: e.message });
+    } finally {
+      setIsScraping(false);
+    }
+  };
 
   // --- Effects ---
   
@@ -258,19 +295,159 @@ export default function Dashboard() {
   };
 
   return (
-    <div className="flex h-screen w-full bg-[#09090b] text-zinc-300 p-4 gap-4 font-mono overflow-hidden">
+    <div className="flex flex-col h-screen w-full bg-[#09090b] text-zinc-300 font-mono overflow-hidden">
+        {/* TOP BAR / TABS */}
+        <div className="h-14 border-b border-zinc-900 bg-zinc-950 flex items-center px-6 justify-between flex-shrink-0">
+             <div className="flex items-center gap-2">
+                <div className="w-3 h-3 bg-neon-green rounded-full animate-pulse" />
+                <span className="font-bold text-white tracking-widest text-lg">INGEST.AI</span>
+             </div>
+             
+             <div className="flex bg-zinc-900 p-1 rounded-lg">
+                <button 
+                    onClick={() => setActiveTab("analyze")}
+                    className={cn(
+                        "px-4 py-1.5 rounded-md text-xs font-bold transition-all flex items-center gap-2",
+                        activeTab === "analyze" ? "bg-zinc-800 text-white shadow-sm" : "text-zinc-500 hover:text-zinc-300"
+                    )}
+                >
+                    <Activity size={14} /> ANALYZE DATA
+                </button>
+                <button 
+                    onClick={() => setActiveTab("create")}
+                    className={cn(
+                        "px-4 py-1.5 rounded-md text-xs font-bold transition-all flex items-center gap-2",
+                        activeTab === "create" ? "bg-zinc-800 text-white shadow-sm" : "text-zinc-500 hover:text-zinc-300"
+                    )}
+                >
+                    <Database size={14} /> CREATE DATA
+                </button>
+             </div>
+             
+             <div className="text-xs text-zinc-500">v0.1.0-alpha</div>
+        </div>
+
+        {/* MAIN CONTENT AREA */}
+        <div className="flex-1 overflow-hidden relative">
+          {activeTab === "create" ? (
+             <div className="h-full w-full p-8 overflow-y-auto">
+                 <div className="max-w-4xl mx-auto space-y-8">
+                    <div className="space-y-2">
+                        <h1 className="text-2xl font-bold text-white flex items-center gap-3">
+                            <Database className="text-neon-green" /> Generative Dataset Construction
+                        </h1>
+                        <p className="text-zinc-500">
+                            Describe the dataset you want to build using natural language. The system will autonomously discover high-relevance video sources via Bright Data, ingest the content, and construct a structured dataset matching your description.
+                        </p>
+                    </div>
+
+                    <div className="glass-panel p-6 space-y-6">
+                        <div className="space-y-2">
+                            <h2 className="text-sm font-bold uppercase text-zinc-400">Dataset Description</h2>
+                            <textarea 
+                                value={createPrompt}
+                                onChange={(e) => setCreatePrompt(e.target.value)}
+                                placeholder="Describe the visual elements you want to extract (e.g., 'Rocket launches', 'People holding Red Bull cans', 'Specific dance moves')..."
+                                className="w-full bg-zinc-900 border border-zinc-800 rounded p-3 text-sm text-white focus:outline-none focus:border-neon-green transition-colors min-h-[100px]"
+                            />
+                        </div>
+
+                        <div className="flex justify-between items-center pt-4 border-t border-zinc-800">
+                            <h2 className="text-sm font-bold uppercase text-zinc-400">
+                                Source URLs <span className="text-zinc-600 normal-case text-xs">(Optional)</span>
+                            </h2>
+                            <button 
+                                onClick={() => setScrapeUrls([...scrapeUrls, ""])}
+                                className="text-xs bg-zinc-800 hover:bg-zinc-700 text-neon-green px-3 py-1.5 rounded font-bold flex items-center gap-1 transition-colors"
+                            >
+                                <Plus size={14} /> ADD SOURCE
+                            </button>
+                        </div>
+                        
+                        <div className="space-y-3">
+                            {scrapeUrls.map((u, idx) => (
+                                <div key={idx} className="flex gap-2">
+                                    <input 
+                                        type="text" 
+                                        placeholder="https://www.twitch.tv/videos/..."
+                                        className="flex-1 bg-zinc-900 border border-zinc-800 rounded p-3 text-sm text-white focus:outline-none focus:border-neon-green transition-colors"
+                                        value={u}
+                                        onChange={(e) => {
+                                            const newUrls = [...scrapeUrls];
+                                            newUrls[idx] = e.target.value;
+                                            setScrapeUrls(newUrls);
+                                        }}
+                                    />
+                                    {scrapeUrls.length > 1 && (
+                                        <button 
+                                            onClick={() => {
+                                                const newUrls = [...scrapeUrls];
+                                                newUrls.splice(idx, 1);
+                                                setScrapeUrls(newUrls);
+                                            }}
+                                            className="p-3 bg-zinc-900 border border-zinc-800 rounded hover:border-red-500 hover:text-red-500 text-zinc-500 transition-colors"
+                                        >
+                                            <Trash2 size={18} />
+                                        </button>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+
+                        <div className="pt-4 border-t border-zinc-800 flex justify-end">
+                            <button 
+                                onClick={handleCreateDataset} 
+                                disabled={isScraping}
+                                className={cn(
+                                    "px-8 py-3 rounded font-bold uppercase tracking-widest text-sm transition-all flex items-center gap-2",
+                                    isScraping 
+                                      ? "bg-zinc-800 text-zinc-500 cursor-not-allowed" 
+                                      : "bg-neon-green text-black hover:bg-white hover:shadow-[0_0_20px_rgba(34,197,94,0.4)]"
+                                )}
+                            >
+                                {isScraping ? <Activity className="animate-spin" /> : <Play size={18} fill="currentColor" />}
+                                {isScraping ? "Initiating Job..." : "Create Dataset"}
+                            </button>
+                        </div>
+                    </div>
+
+                    {scrapeResults && (
+                        <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                             <div className="flex justify-between items-center">
+                                <h2 className="text-sm font-bold uppercase text-zinc-400">Job Status</h2>
+                                <button 
+                                    onClick={() => {
+                                        window.open(`http://localhost:8000/dataset/export?query=${encodeURIComponent(createPrompt)}`, '_blank');
+                                    }}
+                                    className="text-xs bg-neon-green/10 border border-neon-green hover:bg-neon-green/20 text-neon-green px-3 py-1.5 rounded font-bold flex items-center gap-2 transition-colors"
+                                >
+                                    <Download size={14} /> EXPORT DATASET (.ZIP)
+                                </button>
+                             </div>
+                             
+                             <div className="glass-panel p-0 overflow-hidden relative">
+                                 <div className="absolute top-0 right-0 p-2">
+                                     <button className="text-xs bg-zinc-800 hover:bg-zinc-700 text-white px-2 py-1 rounded"
+                                        onClick={() => navigator.clipboard.writeText(JSON.stringify(scrapeResults, null, 2))}
+                                     >
+                                         Copy Info
+                                     </button>
+                                 </div>
+                                 <pre className="p-4 text-xs font-mono text-zinc-300 overflow-x-auto max-h-[400px]">
+                                     {JSON.stringify(scrapeResults, null, 2)}
+                                 </pre>
+                             </div>
+                        </div>
+                    )}
+                 </div>
+             </div>
+          ) : (
+        <div className="flex h-full w-full p-4 gap-4">
       
       {/* --- LEFT COLUMN: CONTROL & TERMINAL --- */}
       <div className="w-1/4 flex flex-col gap-4">
         
-        {/* HEADER */}
-        <div className="glass-panel p-4 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="w-3 h-3 bg-neon-green rounded-full animate-pulse" />
-            <span className="font-bold text-white tracking-widest text-lg">INGEST.AI</span>
-          </div>
-          <span className="text-xs text-zinc-500">v0.1.0-alpha</span>
-        </div>
+        {/* HEADER REMOVED FROM HERE */}
 
         {/* REQUEST TERMINAL */}
         <div className="glass-panel p-6 flex-1 flex flex-col gap-6">
@@ -740,7 +917,10 @@ export default function Dashboard() {
            </button>
         </div>
       </div>
-
+      
+      </div>
+        )}
+        </div>
     </div>
   );
 }
