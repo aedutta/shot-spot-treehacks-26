@@ -108,6 +108,21 @@ class FrameUploadBulk(BaseModel):
 class SearchRequest(BaseModel):
     query: str
     top_k: int = 10
+    source_url: Optional[str] = None
+
+# --- Stats Tracking ---
+# Simple in-memory stats for the demo
+class GlobalStats:
+    total_frames_processed = 0
+    total_bytes_processed = 0
+    last_check_time = time.time()
+    last_frames_count = 0
+    last_bytes_count = 0
+    current_workers_target = 0
+    last_frame_arrival_time = 0
+
+stats_tracker = GlobalStats()
+
 
 # --- Endpoints ---
 
@@ -117,24 +132,56 @@ def root():
 
 @app.get("/stats")
 def stats():
-    """Real stats from MongoDB"""
+    """Real stats based on ingestion activity"""
+    now = time.time()
+    delta = now - stats_tracker.last_check_time
+    
+    # Avoid div/0 if polled too fast
+    if delta < 1:
+        delta = 1
+        
+    # Calculate rates
+    new_frames = stats_tracker.total_frames_processed - stats_tracker.last_frames_count
+    new_bytes = stats_tracker.total_bytes_processed - stats_tracker.last_bytes_count
+    
+    fps = new_frames / delta
+    bandwidth = (new_bytes / 1024 / 1024) / delta # MB/s
+    
+    # Update "last" values for next poll
+    stats_tracker.last_check_time = now
+    stats_tracker.last_frames_count = stats_tracker.total_frames_processed
+    stats_tracker.last_bytes_count = stats_tracker.total_bytes_processed
+    
+    # Determine active workers: if we received frames recently (10s), show target. Else 0.
+    is_active = (now - stats_tracker.last_frame_arrival_time) < 10
+    active = stats_tracker.current_workers_target if is_active else 0
+    
+    # Get total count from DB
     try:
         coll = get_collection()
-        count = coll.count_documents({})
+        total_count = coll.count_documents({})
     except:
-        count = 0
-        
+        total_count = 0
+    
     return {
-        "active_workers": random.randint(5, 100), # Modal status API could go here
-        "fps_processed": random.randint(120, 500),
-        "bandwidth_mbps": random.randint(50, 200),
-        "total_frames": count, 
+        "active_workers": active, 
+        "fps_processed": round(fps, 1),
+        "bandwidth_mbps": round(bandwidth, 1),
+        "total_frames": total_count, 
     }
 
 @app.post("/frames/bulk")
 def upload_frames_bulk(body: FrameUploadBulk):
     ids = []
     print(f"Received {len(body.frames)} frames")
+    
+    # Update Stats
+    stats_tracker.total_frames_processed += len(body.frames)
+    # Estimate size in bytes (rough estimate: json body size)
+    # Each frame has a 512-float vector (512 * 4 bytes = 2KB) plus metadata. Say 3KB per frame.
+    stats_tracker.total_bytes_processed += len(body.frames) * 3000 
+    stats_tracker.last_frame_arrival_time = time.time()
+    
     # Need to import insert_frames from db (bulk version)
     try:
         from db import insert_frames
@@ -184,7 +231,13 @@ def search_frames(req: SearchRequest):
 
     # 2. Search DB
     try:
-        results = search(vector, top_k=req.top_k)
+        # Build Filter Query
+        filter_q = {}
+        if req.source_url:
+            print(f"Filtering by source: {req.source_url}")
+            filter_q["source"] = req.source_url
+
+        results = search(vector, top_k=req.top_k, filter_query=filter_q)
     except Exception as e:
         print(f"DB Search failed: {e}")
         return {"ok": False, "error": str(e)}
@@ -221,8 +274,13 @@ def search_frames(req: SearchRequest):
     return {"ok": True, "results": formatted}
 
 @app.post("/ingest/start")
-async def start_ingest(source_url: str, prompt: str, scale: int, stealth: bool):
+async def start_ingest(source_url: str, prompt: str, scale: int = 10, stealth: bool = False):
     """Trigger the ingestion process via the imported Modal function"""
+    
+    # Update Stats Target
+    stats_tracker.current_workers_target = scale
+    stats_tracker.last_frame_arrival_time = time.time() # Reset activity timer
+    
     try:
         # 1. Lookup the DEPLOYED function. 
         # This requires you to run `modal deploy modal/ingestor.py` in your terminal first.
