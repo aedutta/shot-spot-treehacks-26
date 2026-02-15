@@ -5,7 +5,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { 
   Terminal, Activity, Radio, Cpu, Download, 
   Search, Shield, Zap, Database, Play, Pause,
-  Globe, Video, Layers, AlertCircle, X, Plus, Trash2
+  Globe, Video, Layers, AlertCircle, X, Plus, Trash2,
+  ListVideo, Youtube, Twitch, Film
 } from "lucide-react";
 import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import axios from "axios";
@@ -41,6 +42,18 @@ function embedUrlForSource(sourceUrl: string, startSeconds: number): string | nu
   return null;
 }
 
+function getThumbnailUrl(sourceUrl: string): string | null {
+  try {
+     if (sourceUrl.includes("youtube.com") || sourceUrl.includes("youtu.be")) {
+         const m = sourceUrl.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]+)/);
+         if (m) {
+             return `https://img.youtube.com/vi/${m[1]}/hqdefault.jpg`;
+         }
+     }
+     return null;
+  } catch { return null; }
+}
+
 // --- Mock Data Generator ---
 const generateChartData = () => {
   return Array.from({ length: 20 }, (_, i) => ({
@@ -58,6 +71,7 @@ export default function Dashboard() {
   const [scale, setScale] = useState(10);
   const [stealth, setStealth] = useState(false);
   const [isIngesting, setIsIngesting] = useState(false);
+  const [ingestionProgress, setIngestionProgress] = useState({ current: 0, total: 0, percent: 0, status: 'idle' });
   
   const [stats, setStats] = useState({ active_workers: 0, fps: 0, bandwidth: 0 });
   const [chartData, setChartData] = useState(generateChartData());
@@ -79,17 +93,191 @@ export default function Dashboard() {
   } | null>(null);
 
   // Tab State
-  const [activeTab, setActiveTab] = useState<"analyze" | "create">("analyze");
+  const [activeTab, setActiveTab] = useState<"analyze" | "create" | "import">("analyze");
+
+  // Import Tab State
+  const [importPrompt, setImportPrompt] = useState("");
+  const [importedUrls, setImportedUrls] = useState<string[]>([]);
+  const [isImporting, setIsImporting] = useState(false);
+
+  // File Upload Handler
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = event.target?.result as string;
+      if (!text) return;
+      
+      const lines = text.split('\n');
+      if (lines.length < 2) return;
+      
+      // Simple CSV parser that handles quotes
+      const parseCSVLine = (line: string) => {
+          const res = [];
+          let current = '';
+          let inQuotes = false;
+          for (let i = 0; i < line.length; i++) {
+              const char = line[i];
+              if (char === '"') {
+                  inQuotes = !inQuotes;
+              } else if (char === ',' && !inQuotes) {
+                  res.push(current);
+                  current = '';
+              } else {
+                  current += char;
+              }
+          }
+          res.push(current);
+          return res.map(c => c.trim().replace(/^"|"$/g, ''));
+      };
+
+      const header = parseCSVLine(lines[0]);
+      const urlIndex = header.findIndex(h => h.toLowerCase() === 'url');
+      
+      if (urlIndex === -1) {
+          alert('CSV must contain a "url" column. Found: ' + header.join(', '));
+          return;
+      }
+
+      const urls = lines.slice(1).map(line => {
+          // Skip empty lines
+          if (!line.trim()) return null;
+          const columns = parseCSVLine(line);
+          
+          // Strategy 1: Check "url" column if it exists and has a valid URL
+          if (urlIndex !== -1 && columns.length > urlIndex) {
+             const val = columns[urlIndex]?.trim();
+             // Clean up if it contains a pipe like "Title | URL"
+             const pipeMatch = val.match(/\|\s*(https?:\/\/[^\s]+)/);
+             if (pipeMatch) {
+                 return pipeMatch[1];
+             }
+             
+             if (val && (val.startsWith('http') || val.includes('youtube.com') || val.includes('youtu.be') || val.includes('twitch.tv'))) {
+                 return val;
+             }
+          }
+
+          // Strategy 2: Scan ALL columns for a valid video URL
+          for (const col of columns) {
+              const val = col.trim();
+              
+              // Check for "Title | URL" pattern specifically which seems to be common in your CSV
+              const pipeMatch2 = val.match(/\|\s*(https?:\/\/[^\s]+)/);
+              if (pipeMatch2) {
+                 return pipeMatch2[1];
+              }
+
+              // Check if the cell itself IS a URL
+              if (val.startsWith('http') || val.includes('youtube.com') || val.includes('youtu.be') || val.includes('twitch.tv')) {
+                  return val;
+              }
+              // Check if the cell CONTAINS a URL 
+              const urlMatch = val.match(/(https?:\/\/[^\s|]+)/); // Basic extraction
+              if (urlMatch) {
+                  const extracted = urlMatch[0];
+                  // Verify it's actually a video link we care about
+                  if (extracted.includes('youtube') || extracted.includes('youtu.be') || extracted.includes('twitch')) {
+                      return extracted;
+                  }
+              }
+          }
+          return null;
+      }).filter((u): u is string => !!u);
+      
+      console.log("Extracted URLs:", urls);
+      if (urls.length === 0) {
+        alert("No valid URLs found in the CSV. Make sure they are in a 'url' column and contain http/youtube/twitch links.");
+      } else {
+        setImportedUrls(urls);
+        setLogs(prev => [...prev, `[INFO] Imported ${urls.length} URLs from CSV`]);
+      }
+    };
+    reader.onerror = (error) => console.log('Error reading file:', error);
+    reader.readAsText(file);
+  };
+
+  const handleImportDataset = async () => {
+    setIsImporting(true);
+    setDatasetFrames([]);
+    setScrapeResults(null); 
+    
+    try {
+      if (!importPrompt.trim()) {
+        alert("Please describe the dataset.");
+        setIsImporting(false);
+        return;
+      }
+      
+      if (importedUrls.length === 0) {
+        alert("Please upload a CSV with URLs first.");
+        setIsImporting(false);
+        return;
+      }
+
+      setLogs(prev => [...prev, `[INFO] Starting Import Job: "${importPrompt}" [${importedUrls.length} Sources]...`]);
+
+      const res = await axios.post("http://localhost:8000/dataset/create", {
+        prompt: importPrompt,
+        urls: importedUrls,
+      });
+
+      setScrapeResults(res.data);
+      setLogs(prev => [...prev, `[SUCCESS] Import Job Initiated: ${JSON.stringify(res.data.message)}`]);
+      
+      if (res.status === 200) {
+         setIsMonitoringDataset(true);
+      }
+
+    } catch (e: any) {
+      setLogs(prev => [...prev, `[ERROR] Import error: ${e.message}`]);
+      setScrapeResults({ error: e.message });
+      setIsMonitoringDataset(false);
+    } finally {
+      setIsImporting(false);
+    }
+  };
 
   // Create Tab State
   const [scrapeUrls, setScrapeUrls] = useState<string[]>([""]);
   const [scrapeResults, setScrapeResults] = useState<any>(null);
   const [isScraping, setIsScraping] = useState(false);
   const [createPrompt, setCreatePrompt] = useState("");
+  const [datasetFrames, setDatasetFrames] = useState<any[]>([]);
+  const [isMonitoringDataset, setIsMonitoringDataset] = useState(false);
+
+  const fetchDatasetFrames = async () => {
+    try {
+      // Get URLs that are actually being processed (Twitch links in this demo)
+      // or just all discovered URLs
+      const targetUrls = scrapeResults?.jobs?.map((j: any) => j.url) || [];
+
+      const res = await axios.post("http://localhost:8000/search", {
+          query: createPrompt,
+          top_k: 24,
+          allowed_sources: targetUrls.length > 0 ? targetUrls : undefined
+      });
+      if (res.data.ok && res.data.results.length > 0) {
+          setDatasetFrames(res.data.results);
+      }
+    } catch (e) {
+        console.error("Dataset frame fetch failed", e);
+    }
+  };
+
+  useEffect(() => {
+    if (!isMonitoringDataset || !createPrompt) return;
+    const interval = setInterval(() => fetchDatasetFrames(), 4000);
+    return () => clearInterval(interval);
+  }, [isMonitoringDataset, createPrompt]);
 
   const handleCreateDataset = async () => {
     setIsScraping(true);
     setScrapeResults(null);
+    setDatasetFrames([]); // Clear previous results
+    
     try {
       const validUrls = scrapeUrls.filter((u) => u.trim() !== "");
       
@@ -100,6 +288,7 @@ export default function Dashboard() {
       }
 
       addLog(`Starting Dataset Job: "${createPrompt}" [${validUrls.length > 0 ? validUrls.length + ' Sources' : 'Auto-Discovery'}]...`);
+
       const res = await axios.post("http://localhost:8000/dataset/create", {
         prompt: createPrompt,
         urls: validUrls,
@@ -107,9 +296,16 @@ export default function Dashboard() {
 
       setScrapeResults(res.data);
       addLog(`Dataset Job Initiated: ${JSON.stringify(res.data.message)}`);
+      
+      // Start monitoring for results
+      if (res.data.ok) {
+        setIsMonitoringDataset(true);
+      }
+
     } catch (e: any) {
       addLog(`Dataset error: ${e.message}`);
       setScrapeResults({ error: e.message });
+      setIsMonitoringDataset(false);
     } finally {
       setIsScraping(false);
     }
@@ -131,6 +327,19 @@ export default function Dashboard() {
              fps: res.data.fps_processed || 0,
              bandwidth: res.data.bandwidth_mbps || 0
            });
+        }
+
+        // Poll Ingestion Progress if URL is set
+        if (url) {
+             const statusRes = await axios.get(`http://localhost:8000/ingestion/status?url=${encodeURIComponent(url)}`);
+             if (statusRes.data.status !== "not_found") {
+                setIngestionProgress({
+                  current: statusRes.data.processed_segments,
+                  total: statusRes.data.total_segments,
+                  percent: statusRes.data.progress * 100,
+                  status: statusRes.data.status
+                });
+             }
         }
       } catch (e) {
         // Fallback to simulation if backend down
@@ -233,7 +442,7 @@ export default function Dashboard() {
     try {
       const payload = {
          query: prompt, 
-         top_k: 12,
+         top_k: 48, // Increased to get more candidates for grouping
          source_url: url || undefined
       };
       
@@ -241,58 +450,91 @@ export default function Dashboard() {
       if (res.data.ok) {
         const results = res.data.results as Array<{ timestamp_seconds?: number; [k: string]: unknown }>;
         if (results.length === 0) {
-          setFrames([]);
-          addLog(`DATASET UPDATE: No samples matching "${prompt}"`);
+          // Only clear if we really have no results and it's the first fetch? 
+          // Or just keep old ones? Let's just update provided we aren't completely empty to avoid flashing
+          if (frames.length === 0) setFrames([]);
+          addLog(`Scanning for matches...`);
           return;
         }
-        // Group timestamps into segments and keep only segment-start candidates for the sidebar
+
+        // Group timestamps into videos
         const times = results.map((r) => r.timestamp_seconds ?? 0).filter((t) => typeof t === "number");
         const videoLength = Math.max(...times, 0) + 120;
+        
         try {
           const groupRes = await axios.post("http://localhost:8000/timestamps/group", {
-            times,
-            video_length: videoLength,
+             times,
+             video_length: videoLength,
           });
-          const starts: number[] = groupRes.data?.starts ?? [];
-          if (starts.length === 0) {
-            setFrames(results);
-            addLog(`DATASET UPDATE: Found ${results.length} samples (no grouping)`);
-            return;
+          
+          const segments: number[][] = groupRes.data?.segments ?? [];
+          
+          if (segments.length === 0) {
+             // Fallback to raw results if no segments found (rare)
+             setFrames(results);
+             return;
           }
-          // For each segment start, pick the frame at that start (smallest timestamp_seconds >= start, or closest before)
-          const segmentStartFrames = starts.map((start) => {
-            const atOrAfter = results.filter((r) => (r.timestamp_seconds ?? 0) >= start);
-            if (atOrAfter.length > 0) {
-              return atOrAfter.reduce((a, b) => ((a.timestamp_seconds ?? 0) <= (b.timestamp_seconds ?? 0) ? a : b));
-            }
-            return results.reduce((a, b) => ((a.timestamp_seconds ?? 0) >= (b.timestamp_seconds ?? 0) ? a : b));
+
+          // Map Segments to Frames
+          // refined: finding the frame that is closest to the *start* of the segment
+          const consolidatedFrames = segments.map((seg) => {
+             const [start, end] = seg;
+             
+             // All frames that loosely fall into this segment's range/vicinity
+             // We expand range slightly to catch edge cases
+             const candidates = results.filter(r => {
+                const t = r.timestamp_seconds ?? 0;
+                return t >= start - 1 && t <= end + 1;
+             });
+
+             // If candidates found, pick the one closest to 'start' timestamp
+             let best = candidates.length > 0 
+                ? candidates.reduce((a, b) => Math.abs((a.timestamp_seconds??0) - start) < Math.abs((b.timestamp_seconds??0) - start) ? a : b)
+                : results.reduce((a, b) => Math.abs((a.timestamp_seconds??0) - start) < Math.abs((b.timestamp_seconds??0) - start) ? a : b); // fallback to global closest
+
+              // Format Timestamp Range
+              const fmt = (s: number) => {
+                 const m = Math.floor(s / 60);
+                 const sec = Math.floor(s % 60);
+                 return `${m}:${sec.toString().padStart(2, '0')}`;
+              };
+
+             return {
+                 ...best,
+                 // Override visuals to represent the SEGMENT
+                 timestamp_display: `${fmt(start)} - ${fmt(end)}`,
+                 timestamp_seconds: start, // Play from start
+                 title: `${best.title}`,
+             };
           });
-          // Dedupe by id (same frame can be closest to multiple starts if sparse)
-          const seen = new Set<string>();
-          const deduped = segmentStartFrames.filter((f) => {
-            const id = String(f.id ?? f.timestamp_seconds ?? Math.random());
-            if (seen.has(id)) return false;
-            seen.add(id);
-            return true;
+
+          // Dedupe by ID just in case
+          const seen = new Set();
+          const unique = consolidatedFrames.filter(f => {
+              if (seen.has(f.id)) return false;
+              seen.add(f.id);
+              return true;
           });
-          setFrames(deduped);
-          addLog(`DATASET UPDATE: ${results.length} samples → ${deduped.length} segment starts for "${prompt}"`);
+
+          setFrames(unique);
+          
         } catch (_) {
+          // If grouping fails, show raw
           setFrames(results);
-          addLog(`DATASET UPDATE: Found ${results.length} new samples matching "${prompt}"`);
         }
       }
     } catch (e) {
-      const mockFrames = Array.from({ length: 12 }, (_, i) => ({
-        id: i,
-        url: `https://picsum.photos/seed/${i + Math.random()}/300/200`,
-        score: (0.7 + Math.random() * 0.29).toFixed(4),
-        timestamp: "00:04:23",
-        timestamp_seconds: 263 + i * 10,
-      }));
-      setFrames(mockFrames);
+      console.error(e);
     }
   };
+
+  // Poll for updates during ingestion
+  useEffect(() => {
+    if (isIngesting && prompt) {
+        const i = setInterval(fetchFrames, 3000);
+        return () => clearInterval(i);
+    }
+  }, [isIngesting, prompt, url]);
 
   return (
     <div className="flex flex-col h-screen w-full bg-[#09090b] text-zinc-300 font-mono overflow-hidden">
@@ -300,7 +542,7 @@ export default function Dashboard() {
         <div className="h-14 border-b border-zinc-900 bg-zinc-950 flex items-center px-6 justify-between flex-shrink-0">
              <div className="flex items-center gap-2">
                 <div className="w-3 h-3 bg-neon-green rounded-full animate-pulse" />
-                <span className="font-bold text-white tracking-widest text-lg">INGEST.AI</span>
+                <span className="font-bold text-white tracking-widest text-lg">SHOTSPOT</span>
              </div>
              
              <div className="flex bg-zinc-900 p-1 rounded-lg">
@@ -321,6 +563,15 @@ export default function Dashboard() {
                     )}
                 >
                     <Database size={14} /> CREATE DATA
+                </button>
+                <button 
+                    onClick={() => setActiveTab("import")}
+                    className={cn(
+                        "px-4 py-1.5 rounded-md text-xs font-bold transition-all flex items-center gap-2",
+                        activeTab === "import" ? "bg-zinc-800 text-white shadow-sm" : "text-zinc-500 hover:text-zinc-300"
+                    )}
+                >
+                    <Download size={14} /> IMPORT DATASET
                 </button>
              </div>
              
@@ -433,13 +684,364 @@ export default function Dashboard() {
                                          Copy Info
                                      </button>
                                  </div>
-                                 <pre className="p-4 text-xs font-mono text-zinc-300 overflow-x-auto max-h-[400px]">
+                                 <pre className="p-4 text-xs font-mono text-zinc-300 overflow-x-auto max-h-[200px] border-b border-zinc-800">
                                      {JSON.stringify(scrapeResults, null, 2)}
                                  </pre>
+
+                                 {/* NEW: Discovered Sources List */}
+                                 {scrapeResults.jobs && scrapeResults.jobs.length > 0 && (
+                                     <div className="p-4 bg-zinc-950/50">
+                                         <h3 className="text-xs font-bold text-zinc-500 uppercase mb-3 flex items-center gap-2">
+                                             <ListVideo size={14} /> Discovered Sources
+                                         </h3>
+                                         <div className="grid gap-2">
+                                             {scrapeResults.jobs.map((job: any, i: number) => (
+                                                 <div key={i} className="flex items-center gap-3 text-xs p-2 rounded bg-zinc-900/50 border border-zinc-800/50 hover:border-zinc-700 transition-colors group">
+                                                     {/* Stack Icon */}
+                                                     <div className={cn(
+                                                         "w-2 h-2 rounded-full",
+                                                         job.status === "started" ? "bg-neon-green animate-pulse" : 
+                                                         job.status === "error" ? "bg-red-500" : "bg-yellow-500"
+                                                     )} />
+                                                     
+                                                     {/* Platform Icon */}
+                                                     {job.url.includes("youtube.com") || job.url.includes("youtu.be") ? (
+                                                         <Youtube size={14} className="text-red-400" />
+                                                     ) : (
+                                                         <Twitch size={14} className="text-purple-400" />
+                                                     )}
+
+                                                     {/* Link */}
+                                                     <a href={job.url} target="_blank" rel="noopener noreferrer" className="flex-1 truncate hover:text-white hover:underline decoration-zinc-600 underline-offset-4">
+                                                         {job.url}
+                                                     </a>
+
+                                                     {/* Status Badge */}
+                                                     <span className={cn(
+                                                         "px-2 py-0.5 rounded text-[10px] font-bold uppercase",
+                                                         job.status === "started" ? "bg-neon-green/10 text-neon-green" : 
+                                                         job.status === "error" ? "bg-red-500/10 text-red-500 border border-red-500/20" : "bg-yellow-500/10 text-yellow-500 border border-yellow-500/20"
+                                                     )}>
+                                                         {job.status === "started" ? "INGESTING" : job.status === "discovered_only" ? "DISCOVERED" : "ERROR"}
+                                                     </span>
+                                                     
+                                                     {/* Job ID (if ingesting) */}
+                                                     {job.job_id && (
+                                                         <span className="text-[10px] text-zinc-600 font-mono hidden sm:inline-block">
+                                                             ID: {job.job_id.substring(0,8)}...
+                                                         </span>
+                                                     )}
+                                                 </div>
+                                             ))}
+                                         </div>
+                                     </div>
+                                 )}
                              </div>
                         </div>
                     )}
+
+                    {/* Dataset Visual Explorer */}
+                    {(datasetFrames.length > 0 || isMonitoringDataset) && (
+                         <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500 delay-150">
+                             <div className="flex justify-between items-center">
+                                <h2 className="text-sm font-bold uppercase text-zinc-400 flex items-center">
+                                    <Database className="inline mr-2 text-neon-green" size={16}/> Dataset Visual Explorer
+                                </h2>
+                                <div className="flex items-center gap-2">
+                                   {isMonitoringDataset && (
+                                     <span className="flex items-center gap-2 text-[10px] text-neon-green animate-pulse">
+                                        <Activity size={12} /> LIVE UPDATING
+                                     </span>
+                                   )}
+                                   <span className="text-xs bg-zinc-800 px-2 py-0.5 rounded text-zinc-400 font-mono">
+                                       {datasetFrames.length} SAMPLES
+                                   </span>
+                                </div>
+                             </div>
+                             
+                             {datasetFrames.length === 0 ? (
+                                 <div className="glass-panel p-12 flex flex-col items-center justify-center text-zinc-500 space-y-4 border-dashed">
+                                     <div className="relative">
+                                         <div className="absolute inset-0 bg-neon-green/20 blur-xl rounded-full animate-pulse" />
+                                         <Cpu size={48} className="relative z-10 animate-pulse text-neon-green" />
+                                     </div>
+                                     <div className="text-center space-y-1">
+                                         <h3 className="text-white font-bold">Processing Video Streams...</h3>
+                                         <p className="text-xs max-w-sm">
+                                             Ingesting content, extracting frames, and embedding vectors. 
+                                             New samples will appear here automatically.
+                                         </p>
+                                     </div>
+                                 </div>
+                             ) : (
+                                 <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                                    {datasetFrames.map((frame, i) => (
+                                        <div 
+                                            key={i} 
+                                            className="group relative aspect-video bg-black rounded-lg border border-zinc-800 overflow-hidden hover:border-neon-green transition-all cursor-pointer shadow-lg hover:shadow-neon-green/10"
+                                            onClick={() => setPipFrame({
+                                                source_url: frame.source_url,
+                                                timestamp_seconds: frame.timestamp_seconds,
+                                                title: frame.title
+                                            })}
+                                        >
+                                            {/* Thumbnail / Loading State */}
+                                            <div className="absolute inset-0 flex items-center justify-center bg-zinc-900 text-zinc-700">
+                                                <Film size={24} />
+                                            </div>
+                                            
+                                            {/* Thumbnail & Visuals */}
+                                            {(() => {
+                                                // 1. Try YouTube Thumbnail
+                                                if (frame.source_url.includes('youtube.com') || frame.source_url.includes('youtu.be')) {
+                                                    const vId = frame.source_url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]+)/)?.[1];
+                                                    if (vId) {
+                                                        return (
+                                                            <img 
+                                                                src={`https://img.youtube.com/vi/${vId}/mqdefault.jpg`} 
+                                                                className="absolute inset-0 w-full h-full object-cover opacity-60 group-hover:opacity-100 transition-opacity"
+                                                                alt="Thumbnail"
+                                                            />
+                                                        );
+                                                    }
+                                                }
+                                                
+                                                // 2. Twitch / Other styling
+                                                if (frame.source_url.includes('twitch.tv')) {
+                                                    return (
+                                                        <div className="absolute inset-0 w-full h-full bg-gradient-to-br from-purple-900/20 to-zinc-900 group-hover:from-purple-900/40 transition-all flex flex-col items-center justify-center gap-3">
+                                                            {/* Stylized Glitch Effect Background */}
+                                                            <div className="absolute inset-0 opacity-20 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] mix-blend-overlay"></div>
+                                                            
+                                                            <div className="relative z-10 p-4 rounded-full bg-black/40 backdrop-blur-sm border border-purple-500/30 shadow-[0_0_30px_rgba(168,85,247,0.2)] group-hover:scale-110 transition-transform duration-300">
+                                                                <Twitch size={32} className="text-purple-400" />
+                                                            </div>
+                                                            <div className="flex flex-col items-center">
+                                                                <span className="text-[10px] text-purple-300/70 font-bold uppercase tracking-[0.2em]">Twitch VOD</span>
+                                                                <span className="text-[9px] text-purple-400/50 font-mono">Stream Recording</span>
+                                                            </div>
+                                                        </div>
+                                                    )
+                                                }
+
+                                                // 3. Fallback
+                                                return (
+                                                     <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-900 text-zinc-700">
+                                                        <Film size={24} />
+                                                     </div>
+                                                );
+                                            })()}
+    
+                                            <div className="absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-black via-black/80 to-transparent">
+                                                <div className="flex items-center justify-between">
+                                                    <span className="text-[10px] font-mono text-neon-green bg-black/50 px-1 rounded border border-neon-green/30">
+                                                        {Math.floor(frame.timestamp_seconds / 60)}:{(frame.timestamp_seconds % 60).toString().padStart(2, '0')}
+                                                    </span>
+                                                    <span className="text-[10px] text-zinc-400 truncate max-w-[100px]">
+                                                        {frame.title}
+                                                    </span>
+                                                </div>
+                                            </div>
+                                            
+                                            {/* Hover Play Button */}
+                                            <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/40 backdrop-blur-[1px]">
+                                                <div className="w-10 h-10 rounded-full bg-neon-green text-black flex items-center justify-center shadow-lg transform scale-90 group-hover:scale-100 transition-transform">
+                                                    <Play size={20} fill="currentColor" />
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                 </div>
+                             )}
+                        </div>
+                    )}
                  </div>
+
+                 {/* GLOBAL VIDEO OVERLAY FOR CREATE TAB - Fixed Coverage */}
+                 <AnimatePresence>
+                  {pipFrame && (
+                    <motion.div
+                      initial={{ opacity: 0, scale: 0.95 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.95 }}
+                      transition={{ duration: 0.2 }}
+                      className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-black/80 backdrop-blur-md"
+                      onClick={() => setPipFrame(null)}
+                    >
+                      <div
+                        className="relative w-full max-w-5xl aspect-video rounded-xl overflow-hidden border-2 border-neon-green/50 bg-black shadow-2xl shadow-neon-green/20"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setPipFrame(null)}
+                          className="absolute top-4 right-4 z-30 w-10 h-10 rounded-full bg-black/80 border border-zinc-600 flex items-center justify-center text-white hover:bg-red-500 hover:border-red-500 transition-colors"
+                          aria-label="Close video"
+                        >
+                          <X size={20} />
+                        </button>
+                        <div className="absolute top-4 left-4 z-30 px-3 py-1.5 rounded bg-black/80 text-xs text-neon-green font-mono border border-neon-green/30 truncate max-w-[80%] flex items-center gap-2">
+                          <Play size={12} fill="currentColor" />
+                          <span className="font-bold">{pipFrame.title}</span> 
+                          <span className="text-zinc-500">|</span> 
+                          <span className="text-white">{pipFrame.timestamp_seconds != null ? `${Math.floor(pipFrame.timestamp_seconds / 60)}m ${pipFrame.timestamp_seconds % 60}s` : ""}</span>
+                        </div>
+                        
+                        {embedUrlForSource(pipFrame.source_url, pipFrame.timestamp_seconds ?? 0) ? (
+                          <iframe
+                            src={(embedUrlForSource(pipFrame.source_url, pipFrame.timestamp_seconds ?? 0) ?? "") + "&autoplay=1"}
+                            title={pipFrame.title}
+                            className="w-full h-full"
+                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                            allowFullScreen
+                          />
+                        ) : (
+                          <div className="w-full h-full flex flex-col items-center justify-center gap-4 text-zinc-400 p-8 bg-zinc-900/50">
+                            <Video size={64} className="text-zinc-600" />
+                            <div className="text-center space-y-1">
+                                <h3 className="text-lg font-bold text-white">Playback Unavailable</h3>
+                                <p className="text-sm">This source cannot be embedded directly.</p>
+                            </div>
+                            <a
+                              href={pipFrame.source_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="bg-neon-green text-black px-6 py-2 rounded font-bold hover:bg-white hover:shadow-lg transition-all flex items-center gap-2"
+                            >
+                              Open in New Tab <Globe size={16} />
+                            </a>
+                            <button
+                              type="button"
+                              onClick={() => setPipFrame(null)}
+                              className="text-zinc-500 hover:text-white text-xs underline underline-offset-4"
+                            >
+                              Close Overlay
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </motion.div>
+                  )}
+                 </AnimatePresence>
+             </div>
+          ) : activeTab === "import" ? (
+             <div className="h-full w-full p-8 overflow-y-auto">
+                 <div className="max-w-4xl mx-auto space-y-8">
+                    <div className="space-y-2">
+                        <h1 className="text-2xl font-bold text-white flex items-center gap-3">
+                            <Download className="text-neon-green" /> Import Dataset from CSV
+                        </h1>
+                        <p className="text-zinc-500">
+                            Upload a CSV file containing video URLs to process specific sources against a descriptive query.
+                        </p>
+                    </div>
+
+                    <div className="glass-panel p-6 space-y-6">
+                        <div className="space-y-2">
+                             <h2 className="text-sm font-bold uppercase text-zinc-400">Dataset Description</h2>
+                             <textarea 
+                                value={importPrompt}
+                                onChange={(e) => setImportPrompt(e.target.value)}
+                                placeholder="Describe what you want to find in these videos..."
+                                className="w-full bg-zinc-900 border border-zinc-800 rounded p-3 text-sm text-white focus:outline-none focus:border-neon-green transition-colors min-h-[100px]"
+                            />
+                        </div>
+
+                        <div className="space-y-2 pt-4 border-t border-zinc-800">
+                             <h2 className="text-sm font-bold uppercase text-zinc-400">Upload CSV</h2>
+                             <label className="border-2 border-dashed border-zinc-800 rounded-lg p-8 flex flex-col items-center justify-center gap-2 hover:border-neon-green hover:bg-zinc-900/50 transition-all cursor-pointer group">
+                                <input type="file" accept=".csv" className="hidden" onChange={handleFileUpload} />
+                                <div className="p-3 bg-zinc-900 rounded-full group-hover:scale-110 transition-transform">
+                                   <Database size={24} className="text-zinc-500 group-hover:text-neon-green" />
+                                </div>
+                                <span className="text-sm text-zinc-400 font-bold">Click to Upload CSV</span>
+                                <span className="text-xs text-zinc-600">Must contain a 'url' column</span>
+                             </label>
+                             {importedUrls.length > 0 && (
+                                <div className="mt-2 text-xs text-neon-green flex items-center gap-2">
+                                    <Shield size={12} /> Successfully loaded {importedUrls.length} valid URLs
+                                </div>
+                             )}
+                        </div>
+
+                        <div className="pt-4 border-t border-zinc-800 flex justify-end">
+                            <button 
+                                onClick={handleImportDataset} 
+                                disabled={isImporting || importedUrls.length === 0}
+                                className={cn(
+                                    "px-8 py-3 rounded font-bold uppercase tracking-widest text-sm transition-all flex items-center gap-2",
+                                    isImporting || importedUrls.length === 0
+                                      ? "bg-zinc-800 text-zinc-500 cursor-not-allowed" 
+                                      : "bg-neon-green text-black hover:bg-white hover:shadow-[0_0_20px_rgba(34,197,94,0.4)]"
+                                )}
+                            >
+                                {isImporting ? <Activity className="animate-spin" /> : <Play size={18} fill="currentColor" />}
+                                {isImporting ? "Processing Import..." : "Start Import Job"}
+                            </button>
+                        </div>
+                    </div>
+                 </div>
+                 
+                  {/* Reuse Dataset Visual Explorer for Import Results */}
+                    {(datasetFrames.length > 0 || (isMonitoringDataset && importedUrls.length > 0)) && (
+                         <div className="mt-8 max-w-4xl mx-auto space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500 delay-150">
+                             <div className="flex justify-between items-center">
+                                <h2 className="text-sm font-bold uppercase text-zinc-400 flex items-center">
+                                    <Database className="inline mr-2 text-neon-green" size={16}/> Imported Clips Explorer
+                                </h2>
+                                <div className="flex items-center gap-2">
+                                   {isMonitoringDataset && (
+                                     <span className="flex items-center gap-2 text-[10px] text-neon-green animate-pulse">
+                                        <Activity size={12} /> PROCESSING
+                                     </span>
+                                   )}
+                                   <span className="text-xs bg-zinc-800 px-2 py-0.5 rounded text-zinc-400 font-mono">
+                                       {datasetFrames.length} CLIPS PROCESSED
+                                   </span>
+                                   {importedUrls.length > 0 && (
+                                     <span className="text-xs bg-zinc-800 px-2 py-0.5 rounded text-zinc-500 font-mono border border-zinc-700">
+                                         FROM {importedUrls.length} VIDEOS
+                                     </span>
+                                   )}
+                                </div>
+                             </div>
+                             
+                             <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                                {datasetFrames.map((frame, i) => (
+                                    <div 
+                                        key={i} 
+                                        className="group relative aspect-video bg-black rounded-lg border border-zinc-800 overflow-hidden hover:border-neon-green transition-all cursor-pointer shadow-lg hover:shadow-neon-green/10"
+                                        onClick={() => setPipFrame({
+                                            source_url: frame.source_url,
+                                            timestamp_seconds: frame.timestamp_seconds,
+                                            title: frame.title
+                                        })}
+                                    >
+                                        <div className="absolute inset-0 flex items-center justify-center bg-zinc-900 text-zinc-700">
+                                            <Film size={24} />
+                                        </div>
+                                        <img 
+                                            src={frame.url || (frame.source_url.includes('youtube') ? `https://img.youtube.com/vi/${frame.source_url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]+)/)?.[1]}/mqdefault.jpg` : '')} 
+                                            className="absolute inset-0 w-full h-full object-cover opacity-60 group-hover:opacity-100 transition-opacity"
+                                            onError={(e) => e.currentTarget.style.display = 'none'}
+                                            alt=""
+                                        />
+                                        
+                                        <div className="absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-black via-black/80 to-transparent">
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-[10px] font-mono text-neon-green bg-black/50 px-1 rounded border border-neon-green/30">
+                                                    {Math.floor(frame.timestamp_seconds / 60)}:{(frame.timestamp_seconds % 60).toString().padStart(2, '0')}
+                                                </span>
+                                                <span className="text-[10px] text-zinc-400 truncate max-w-[100px]">
+                                                    {frame.title}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))}
+                             </div>
+                        </div>
+                    )}
              </div>
           ) : (
         <div className="flex h-full w-full p-4 gap-4">
@@ -579,7 +1181,25 @@ export default function Dashboard() {
             </div>
           </div>
 
-          <div className="mt-auto">
+          <div className="mt-auto space-y-4">
+             {/* Progress Bar */}
+             {(isIngesting || ingestionProgress.status === 'processing' || ingestionProgress.percent > 0) && (
+                  <div className="space-y-1 animate-in fade-in slide-in-from-bottom-2">
+                      <div className="flex justify-between text-[10px] uppercase font-bold text-zinc-500 font-mono">
+                          <span>Ingestion Progress</span>
+                          <span className="text-neon-green">{Math.round(ingestionProgress.percent)}% ({ingestionProgress.current}/{ingestionProgress.total})</span>
+                      </div>
+                      <div className="h-1.5 w-full bg-zinc-800 rounded-full overflow-hidden border border-zinc-800">
+                          <div 
+                              className="h-full bg-neon-green shadow-[0_0_10px_currentColor] transition-all duration-500 ease-out relative"
+                              style={{ width: `${Math.max(2, ingestionProgress.percent)}%` }}
+                          >
+                            <div className="absolute inset-0 bg-white/20 animate-pulse" />
+                          </div>
+                      </div>
+                  </div>
+             )}
+
              <button
                 onClick={isIngesting ? handleStop : handleStart}
                 className={cn(
@@ -714,7 +1334,7 @@ export default function Dashboard() {
                   animate={{ opacity: 1, scale: 1 }}
                   exit={{ opacity: 0, scale: 0.95 }}
                   transition={{ duration: 0.2 }}
-                  className="absolute inset-0 z-20 flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm"
+                  className="fixed inset-0 z-[200] flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm"
                   onClick={() => setPipFrame(null)}
                 >
                   <div
@@ -885,7 +1505,14 @@ export default function Dashboard() {
                     key={i}
                     className="group relative aspect-video bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden hover:border-neon-green transition-all cursor-pointer"
                   >
-                    <img src={frame.url} className="w-full h-full object-cover opacity-60 group-hover:opacity-80 transition-opacity" alt="" />
+                   {/* Twitch Logo Overlay */}
+                    {frame.source_url && frame.source_url.includes('twitch') ? (
+                         <div className="w-full h-full bg-[#9146FF]/20 flex items-center justify-center opacity-60 group-hover:opacity-100 transition-opacity">
+                            <Twitch size={48} className="text-[#9146FF]" />
+                         </div>
+                    ) : (
+                        <img src={frame.url} className="w-full h-full object-cover opacity-60 group-hover:opacity-80 transition-opacity" alt="" />
+                    )}
                     <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
                         <div className="w-10 h-10 bg-neon-green/90 rounded-full flex items-center justify-center shadow-lg shadow-neon-green/20 backdrop-blur-sm">
                             <Play size={18} className="text-black ml-1" fill="currentColor" />
@@ -894,14 +1521,20 @@ export default function Dashboard() {
                     <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black via-black/90 to-transparent p-3 pt-8">
                        <div className="flex justify-between items-end">
                           <div className="flex flex-col gap-0.5">
+                             {/* Twitch Styling Fix */}
                              <div className="flex items-center gap-1.5 text-[10px] text-neon-green font-mono font-bold">
-                                <Activity size={10} />
+                                {frame.source_url && frame.source_url.includes('twitch') ? (
+                                    <Twitch size={10} />
+                                ) : (
+                                    <Activity size={10} />
+                                )}
                                 {(parseFloat(frame.score) * 100).toFixed(1)}% MATCH
                              </div>
                              <div className="text-xs text-white font-bold truncate max-w-[120px]">{frame.title}</div>
                           </div>
                           <span className="text-[10px] bg-zinc-800 text-zinc-300 px-1.5 py-0.5 rounded border border-zinc-700 font-mono">
-                            {frame.timestamp}
+                            {/* @ts-ignore */}
+                            {frame.timestamp_display || frame.timestamp}
                           </span>
                        </div>
                     </div>

@@ -1,4 +1,4 @@
-# Ingest.ai Frontend
+# ShotSpot Frontend
 
 ## Setup
 1. Install dependencies:

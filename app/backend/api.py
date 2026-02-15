@@ -94,7 +94,7 @@ def embed_text(text: str) -> List[float]:
     return vec
 
 app = FastAPI(
-    title="Ingest.ai API",
+    title="ShotSpot API",
     description="Just-in-Time Dataset Factory API",
 )
 
@@ -130,8 +130,9 @@ class FrameUploadBulk(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str
-    top_k: int = 10
+    top_k: int = 24
     source_url: Optional[str] = None
+    allowed_sources: Optional[List[str]] = None
 
 # --- Stats Tracking ---
 # Simple in-memory stats for the demo
@@ -146,6 +147,14 @@ class GlobalStats:
 
 stats_tracker = GlobalStats()
 
+
+# --- Ingestion Job Tracking ---
+# Simple in-memory: { "url": { "total": int, "processed": int, "status": "processing" } }
+ingestion_jobs = {}
+
+class IngestionInitRequest(BaseModel):
+    url: str
+    total_segments: int
 
 # --- Bright Data Integration ---
 API_KEY = os.environ.get("BRIGHTDATA_API_KEY", "")
@@ -405,6 +414,17 @@ async def create_dataset_endpoint(request: CreateDatasetRequest):
             url = url.strip()
             if not url: 
                 continue
+            
+            # Constraints: Only run ingestion (CLIP/Modal) on Twitch links
+            # YouTube or other links are returned as "discovered" but not processed
+            if "twitch.tv" not in url:
+                results.append({
+                    "url": url,
+                    "status": "discovered_only", 
+                    "message": "Ingestion skipped (Non-Twitch link)",
+                    "job_id": None
+                })
+                continue
                 
             try:
                 # Spawn async - this runs the "Analyze Data" pipeline on this URL
@@ -552,6 +572,18 @@ def upload_frames_bulk(body: FrameUploadBulk):
     stats_tracker.total_bytes_processed += len(body.frames) * 3000 
     stats_tracker.last_frame_arrival_time = time.time()
     
+    # Update Per-Job Stats
+    if body.frames:
+        src = body.frames[0].source
+        if src and src in ingestion_jobs:
+            job = ingestion_jobs[src]
+            job["processed_segments"] += 1
+            job["processed_frames"] += len(body.frames)
+            job["last_update"] = time.time()
+            if job["processed_segments"] >= job["total_segments"]:
+                job["status"] = "completed"
+            print(f"📊 Job Update [{src}]: {job['processed_segments']}/{job['total_segments']} segments")
+
     # Need to import insert_frames from db (bulk version)
     try:
         from db import insert_frames
@@ -606,6 +638,12 @@ def search_frames(req: SearchRequest):
         if req.source_url:
             print(f"Filtering by source: {req.source_url}")
             filter_q["source"] = req.source_url
+        
+        if req.allowed_sources:
+            print(f"Filtering by {len(req.allowed_sources)} allowed sources")
+            # MongoDB Atlas Search syntax for "IN" is slightly different depending on mapping
+            # Standard MQL match uses $in
+            filter_q["source"] = {"$in": req.allowed_sources}
 
         results = search(vector, top_k=req.top_k, filter_query=filter_q)
     except Exception as e:
@@ -717,6 +755,47 @@ async def start_ingest(source_url: str, prompt: str, scale: int = 10, stealth: b
             "error": str(e),
             "message": f"Failed to trigger Modal function: {str(e)}"
         }
+
+@app.post("/ingestion/init")
+def init_ingestion(req: IngestionInitRequest):
+    print(f"🏁 Ingestion Init: {req.total_segments} segments for {req.url}")
+    ingestion_jobs[req.url] = {
+        "total_segments": req.total_segments,
+        "processed_segments": 0,
+        "processed_frames": 0,
+        "start_time": time.time(),
+        "last_update": time.time(),
+        "status": "processing"
+    }
+    return {"ok": True}
+
+@app.get("/ingestion/status")
+def get_ingestion_status(url: str):
+    # Try exact match or match ignoring http/https/www variations?
+    # For now, simplistic
+    job = ingestion_jobs.get(url)
+    if not job:
+        # Check if we have any job that contains this URL substring (e.g. yt-dlp canonicalization)
+        for job_url, j in ingestion_jobs.items():
+            if url in job_url or job_url in url:
+                job = j
+                break
+    
+    if not job:
+        return {"status": "not_found", "progress": 0}
+    
+    total = job["total_segments"]
+    current = job["processed_segments"]
+    # Cap progress at 99% until fully complete? Or just 1.0
+    progress = min(1.0, current / total) if total > 0 else 0
+    
+    return {
+        "status": job["status"],
+        "progress": progress,
+        "total_segments": total,
+        "processed_segments": current,
+        "frames": job["processed_frames"]
+    }
 
 if __name__ == "__main__":
     import uvicorn

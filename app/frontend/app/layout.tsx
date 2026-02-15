@@ -2,7 +2,7 @@ import "./globals.css";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Ingest.ai | Dataset Factory",
+  title: " | Dataset Factory",
   description: "Modal + Bright Data Video Ingestion Dashboard",
 };
 

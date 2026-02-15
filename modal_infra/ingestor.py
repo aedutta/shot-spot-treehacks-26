@@ -6,11 +6,14 @@ from pathlib import Path
 # Configuration
 CACHE_DIR = "/data"  # Shared Volume
 MODEL_REPO = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
-SEGMENT_DURATION = 60 # Seconds per parallel worker
+# Reduce segment duration to increase parallelism. 
+# 15s segments = 4x more workers per video minute compared to 60s.
+SEGMENT_DURATION = 15 
 
 # Transcription
 WHISPER_MODEL = "base"
-MAX_CONTAINERS = 20
+# Increase max containers to allow massive parallelism
+MAX_CONTAINERS = 100
 
 # 1. Define Image
 def download_model_build_step():
@@ -80,22 +83,23 @@ class VideoWorker:
     @modal.enter()
     def setup(self):
         import torch
-        from transformers import CLIPProcessor, CLIPModel, pipeline, AutoModelForSpeechSeq2Seq, AutoProcessor
+        from transformers import CLIPProcessor, CLIPModel, pipeline, AutoModelForSpeechSeq2Seq, AutoProcessor, logging as hf_logging
         import warnings
         
-        # Suppress benign warnings from Transformers/Whisper
-        warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
+        # Suppress noise
+        warnings.filterwarnings("ignore")
+        hf_logging.set_verbosity_error()
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"⚡ Loading Models on {self.device}...", flush=True)
+        print(f"⚡ Loading Models on {self.device}... (v3.4 Silence)", flush=True)
         
         # Load CLIP
         self.processor = CLIPProcessor.from_pretrained(MODEL_REPO, local_files_only=True)
         self.model = CLIPModel.from_pretrained(MODEL_REPO, local_files_only=True).to(self.device)
         self.model.eval()
         
-        # Load Whisper safely using HF Pipeline (More robust & faster on A10G)
-        model_id = "openai/whisper-base"
+        # Load Whisper
+        model_id = "openai/whisper-tiny"
         
         whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
             model_id, 
@@ -103,6 +107,10 @@ class VideoWorker:
             low_cpu_mem_usage=True, 
             use_safetensors=True
         ).to(self.device)
+        
+        # Fix conflict warning
+        whisper_model.config.forced_decoder_ids = None
+        whisper_model.generation_config.forced_decoder_ids = None
         
         whisper_processor = AutoProcessor.from_pretrained(model_id)
 
@@ -112,7 +120,7 @@ class VideoWorker:
             tokenizer=whisper_processor.tokenizer,
             feature_extractor=whisper_processor.feature_extractor,
             chunk_length_s=30,
-            batch_size=8,  # Better throughput
+            batch_size=8,
             torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
             device=self.device,
         )
@@ -138,122 +146,82 @@ class VideoWorker:
         import numpy as np
         import tempfile
 
-        print(f"▶️ Processing Segment {start}-{end}s: {title}", flush=True)
+        print(f"▶️ Processing Segment {start}-{end}s: {title} (v3.3)", flush=True)
 
-        try:
-            stream_url, headers = self._get_stream_info(video_url)
-        except Exception as e:
-            print(f"❌ Stream extraction failed: {e}")
-            return 0
-
-        # Build headers for FFMPEG (Critical for TikTok/Twitch)
-        headers_list = []
-        for k, v in headers.items():
-            headers_list.append(f"{k}: {v}")
-        headers_str = "\r\n".join(headers_list)
-        if headers_str:
-            headers_str += "\r\n"
-
-        # --- 1. Audio Transcription (On the fly) ---
-        transcription_text = ""
-        try:
-            # We use a directory to avoid file locking/existence issues with yt-dlp
-            with tempfile.TemporaryDirectory() as temp_dir:
-                audio_path = os.path.join(temp_dir, "audio.wav")
-                
-                # Use yt-dlp to download the audio segment directly
-                # This is more robust against 403s than ffmpeg -i URL because yt-dlp handles the session/cookies
-                cmd_audio = [
-                    "yt-dlp",
-                    "--quiet", "--no-warnings",
-                    "--download-sections", f"*{start}-{end}",
-                    "--force-keyframes-at-cuts",
-                    "--extract-audio",
-                    "--audio-format", "wav",
-                    "--audio-quality", "0",
-                    "--output", audio_path,
-                    video_url
-                ]
-                
-                # Add extractor args for spoofing if needed
-                cmd_audio.extend(["--extractor-args", "youtube:player_client=android,ios"])
-
-                try:
-                    subprocess.run(cmd_audio, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
-                except subprocess.CalledProcessError as e:
-                    # If yt-dlp fails (e.g. no audio stream?), we catch it
-                    print(f"FAILED yt-dlp Audio Cmd: {' '.join(cmd_audio)}")
-                    print(f"Error output: {e.stderr.decode()}")
-                    raise e
-                
-                # Verify file exists (yt-dlp might add extension but we forced wav)
-                # simpler: just listdir and pick the first file
-                files = os.listdir(temp_dir)
-                if not files:
-                    raise FileNotFoundError("yt-dlp did not produce an audio file")
-                
-                final_audio_path = os.path.join(temp_dir, files[0])
-                
-                # Transcribe using pipeline
-                # We can load into memory or pass path
-                res = self.transcriber(
-                    final_audio_path, 
-                    batch_size=8,
-                    return_timestamps=True,
-                    generate_kwargs={"language": "en"}
-                )
-                transcription_text = res.get("text", "").strip() # type: ignore
-        except Exception as e:
-            print(f"⚠️ Audio failed for segment {start}s (skipping text): {e}", flush=True)
-
-        # Embed Transcription if exists
-        text_embedding = None
-        if transcription_text:
-            inputs = self.processor(text=[transcription_text], return_tensors="pt", padding=True, truncation=True).to(self.device)
-            with torch.no_grad():
-                emb = self.model.get_text_features(**inputs)
-                emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
-                text_embedding = emb.cpu().numpy()[0]
-
-        # --- 2. Frame Extraction & Embedding ---
-        # Use yt-dlp to download the video segment to a temp file, then process with ffmpeg
-        # This is more robust than streaming directly with ffmpeg
-        
         frames = []
         timestamps = []
+        transcription_text = ""
         
+        # Combined download & processing to save bandwidth and startup time
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                video_path = os.path.join(temp_dir, "video.mp4")
+                media_path = os.path.join(temp_dir, "segment.mp4")
                 
-                cmd_video_dl = [
+                # 1. Single Download (Video + Audio)
+                cmd_dl = [
                     "yt-dlp",
                     "--quiet", "--no-warnings",
                     "--download-sections", f"*{start}-{end}",
                     "--force-keyframes-at-cuts",
+                    # Best mp4 video + best m4a audio, merged
                     "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                    "--output", video_path,
+                    "--output", media_path,
                     video_url
                 ]
-                # Spoofing args
-                cmd_video_dl.extend(["--extractor-args", "youtube:player_client=android,ios"])
+                # Spoofing args for TikTok/YT
+                cmd_dl.extend(["--extractor-args", "youtube:player_client=android,ios"])
                 
-                # Download segment
-                subprocess.run(cmd_video_dl, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
-                
-                # Verify file
-                files = os.listdir(temp_dir)
-                if not files:
-                    print(f"⚠️ yt-dlp failed to download video segment {start}-{end}")
+                try:
+                    subprocess.run(cmd_dl, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+                except subprocess.CalledProcessError as e:
+                    print(f"❌ Download failed for {start}-{end}: {e.stderr.decode()}")
                     return 0
                 
-                final_video_path = os.path.join(temp_dir, files[0])
+                # Verify file
+                if not os.path.exists(media_path):
+                    # Sometimes yt-dlp appends .mp4 or .mkv dependent on merge
+                    # Just pick the largest file in temp_dir
+                    files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir)]
+                    if not files: 
+                         print(f"⚠️ No file downloaded for {start}-{end}")
+                         return 0
+                    media_path = max(files, key=os.path.getsize)
 
-                # Extract frames from the LOCAL file
+                # 2. Transcription (Robust In-Memory FFMPEG)
+                try:
+                    # Direct PCM decode to memory avoids "Soundfile" format errors entirely
+                    cmd_audio = [
+                        "ffmpeg", "-i", media_path,
+                        "-f", "s16le", "-ac", "1", "-ar", "16000", # 16k mono PCM
+                        "-vn", "-loglevel", "error", "-"
+                    ]
+                    
+                    proc_audio = subprocess.run(cmd_audio, capture_output=True, check=False)
+                    if proc_audio.returncode == 0 and len(proc_audio.stdout) > 0:
+                        # Convert bytes -> float32 numpy array
+                        audio_np = np.frombuffer(proc_audio.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+                        
+                        res = self.transcriber(
+                            {"raw": audio_np, "sampling_rate": 16000},
+                            batch_size=8,
+                            return_timestamps=True,
+                            generate_kwargs={"language": "en"}
+                        )
+                        transcription_text = res.get("text", "").strip() # type: ignore
+                    else:
+                        print(f"⚠️ Audio extraction warning (ffmpeg output empty or failed)")
+                        
+                except Exception as e:
+                    print(f"⚠️ Transcription warning: {e}")
+
+                # 3. Frame Extraction (Reduced FPS for speed: 0.2 FPS = 1 frame every 5s)
+                # This reduces CLIP load by 5-25x compared to 1fps or 5fps
+                INTERVAL = 5
+                
                 cmd_ffmpeg = [
                     "ffmpeg", 
-                    "-i", final_video_path,
-                    "-vf", "fps=1,scale=224:224", 
+                    "-i", media_path,
+                    "-vf", f"fps=1/{INTERVAL},scale=224:224", 
                     "-f", "image2pipe",
                     "-pix_fmt", "rgb24",
                     "-vcodec", "rawvideo", 
@@ -269,37 +237,44 @@ class VideoWorker:
                     raw = process.stdout.read(frame_bytes)
                     if len(raw) != frame_bytes: break
                     frames.append(Image.frombytes("RGB", (224, 224), raw))
-                    timestamps.append(start + frame_idx) 
+                    # Calculate timestamp properly based on interval
+                    timestamps.append(start + (frame_idx * INTERVAL)) 
                     frame_idx += 1
                 
                 process.terminate()
 
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Video download/processing failed for {start}-{end}: {e.stderr.decode()}")
-            return 0
         except Exception as e:
-            print(f"❌ Error in video pipeline: {e}")
+            print(f"❌ processing_pipeline critical error: {e}")
             return 0
             
         if not frames:
             print(f"⚠️ No frames extracted for {start}-{end}s")
             return 0
 
-        # Batch Embed Images (rest of the code...)
+        # Batch Embed Images (optimized)
         inputs = self.processor(images=frames, return_tensors="pt", padding=True).to(self.device)
         with torch.no_grad():
             img_emb = self.model.get_image_features(**inputs)
             img_emb = img_emb / img_emb.norm(p=2, dim=-1, keepdim=True)
         img_emb = img_emb.cpu().numpy()
 
+        # Embed Text Context (Once)
+        text_embedding = None
+        if transcription_text:
+            inputs = self.processor(text=[transcription_text], return_tensors="pt", padding=True, truncation=True).to(self.device)
+            with torch.no_grad():
+                emb = self.model.get_text_features(**inputs)
+                emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
+                text_embedding = emb.cpu().numpy()[0]
+
         # Combine Image + Text (Late Fusion)
         results = []
         for i, t in enumerate(timestamps):
             vec = img_emb[i]
-            # If we have text for this segment, add it to every frame in the segment
+            # Add text context to every frame in segment
             if text_embedding is not None:
                 vec = vec + text_embedding
-                vec = vec / (np.linalg.norm(vec) + 1e-9) # Renormalize
+                vec = vec / (np.linalg.norm(vec) + 1e-9) 
             
             results.append({
                 "time": t, 
@@ -331,10 +306,15 @@ class VideoWorker:
                 continue
 
 # 3. Orchestrator
-@app.function(image=image)
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("mongo")]
+)
 def ingest_video_orchestrator(url: str):
     import yt_dlp
     import math
+    import requests
+    import os
 
     print(f"🔎 Analyzing {url}...")
     try:
@@ -360,6 +340,21 @@ def ingest_video_orchestrator(url: str):
 
     print(f"🚀 Launching {len(segments)} parallel workers...")
     
+    # Notify backend of job start
+    try:
+        api_url = os.environ.get("VECTOR_API_URL")
+        # Strip trailing / if present
+        if api_url:
+            print(f"📣 Notifying backend: {len(segments)} segments to {api_url}")
+            requests.post(
+                api_url.rstrip("/") + "/ingestion/init",
+                json={"url": url, "total_segments": len(segments)},
+                headers={"X-API-Key": os.environ.get("VECTOR_API_KEY", "")},
+                timeout=10
+            )
+    except Exception as e:
+        print(f"⚠️ Failed to init job stats: {e}")
+
     # Run in parallel
     worker = VideoWorker()
     list(worker.process_segment_pipeline.starmap(segments))
