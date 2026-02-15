@@ -949,7 +949,7 @@ export default function Dashboard() {
                             <Download className="text-neon-green" /> Import Dataset from CSV
                         </h1>
                         <p className="text-zinc-500">
-                            Upload a CSV file containing video URLs to process specific sources against a descriptive query.
+                            Upload a descriptive query, a CSV file containing video URLs to process specific sources and data.
                         </p>
                     </div>
 
