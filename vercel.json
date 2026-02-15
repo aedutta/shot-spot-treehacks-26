@@ -6,11 +6,19 @@
       "use": "@vercel/python"
     },
     {
+      "src": "api/debug_env.py",
+      "use": "@vercel/python"
+    },
+    {
       "src": "app/frontend/package.json",
       "use": "@vercel/next"
     }
   ],
   "routes": [
+    {
+      "src": "/api/debug-env",
+      "dest": "/api/debug_env.py"
+    },
     {
       "src": "/api/(.*)",
       "dest": "/api/index.py"
