@@ -159,7 +159,7 @@ class VideoWorker:
                 url, 
                 json={"frames": vectors}, 
                 headers=headers,
-                timeout=15
+                timeout=60
             )
             resp.raise_for_status()
         except Exception as e:

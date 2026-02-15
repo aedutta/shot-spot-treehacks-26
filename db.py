@@ -84,6 +84,40 @@ def insert_frame(
     return result.inserted_id
 
 
+def insert_frames(
+    frames_data: List[dict],
+    collection: Union[Collection, None] = None,
+    collection_name: str = "frames",
+) -> List[Any]:
+    """
+    Insert multiple frames at once (bulk write).
+    
+    Args:
+        frames_data: List of dicts, each having "embedding" (list/array) and metadata.
+        collection: Target collection.
+        
+    Returns:
+        List of inserted _ids.
+    """
+    if not frames_data:
+        return []
+        
+    if collection is None:
+        collection = get_collection(collection_name=collection_name)
+
+    # Ensure embeddings are lists
+    docs = []
+    for f in frames_data:
+         d = f.copy()
+         if "embedding" in d and hasattr(d["embedding"], "tolist"):
+             d["embedding"] = d["embedding"].tolist()
+         docs.append(d)
+
+    result = collection.insert_many(docs)
+    return result.inserted_ids
+
+
+
 def search(
     query_embedding: Union[List[float], np.ndarray],
     collection: Union[Collection, None] = None,
