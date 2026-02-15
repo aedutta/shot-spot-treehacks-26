@@ -305,7 +305,7 @@ async def start_ingest(source_url: str, prompt: str, scale: int = 10, stealth: b
         f = modal.Function.from_name("treehacks-video-ingestor-v2", "ingest_video_orchestrator")
         
         # 2. Spawn the function execution asynchronously on the cloud
-        call = f.spawn(source_url)
+        call = await f.spawn.aio(source_url)
         
         return {
             "ok": True, 

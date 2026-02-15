@@ -4,29 +4,23 @@ import uuid
 from pathlib import Path
 
 # Configuration
-CACHE_DIR = "/data"  # Path for the Shared Volume (Audio, Whisper)
-MODEL_CACHE_DIR = "/root/models"  # Path for the Baked CLIP Model (Image)
-# Upgrade to LAION-2B (512-dim) for better relevance (used for both image and text embeddings)
+CACHE_DIR = "/data"  # Shared Volume
 MODEL_REPO = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
-SEGMENT_DURATION = 60
+SEGMENT_DURATION = 60 # Seconds per parallel worker
 
-# Transcription (overlapping windows)
+# Transcription
 WHISPER_MODEL = "base"
-WINDOW_DURATION = 10
-WINDOW_OVERLAP = 2
-MAX_TRANSCRIPTION_CONTAINERS = 10
+MAX_CONTAINERS = 20
 
-# 1. Define Image with Baked-in Model + Node.js + Cookies + Whisper
+# 1. Define Image
 def download_model_build_step():
     from transformers import CLIPProcessor, CLIPModel
     import os
-    # SAVE TO BAKED PATH
     os.environ["HF_HUB_CACHE"] = "/root/models"
     print(f"🏗️ Baking {MODEL_REPO} into image...")
     CLIPProcessor.from_pretrained(MODEL_REPO)
     CLIPModel.from_pretrained(MODEL_REPO)
 
-# Base Image
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "git", "nodejs", "npm", "locales")
@@ -35,7 +29,6 @@ image = (
         "locale-gen en_US.UTF-8",
         "update-locale LANG=en_US.UTF-8",
     )
-    # USE BAKED PATH FOR RUNTIME LOOKUP
     .env({"LANG": "en_US.UTF-8", "HF_HUB_CACHE": "/root/models"})
     .pip_install(
         "torch==2.5.1",
@@ -45,23 +38,22 @@ image = (
         "requests",
         "numpy",
         "openai-whisper",
+        "accelerate",
     )
     .run_function(download_model_build_step)
 )
 
-# Volume for audio + Whisper model cache (shared across workers)
 model_cache = modal.Volume.from_name("treehacks-video-ingestor-cache", create_if_missing=True)
-
 
 # --- Helper Functions ---
 
 def get_yt_dlp_opts(filename=None):
-    """Standardized yt-dlp options for automated ingestion"""
+    """Standardized yt-dlp options"""
     opts = {
-        "quiet": True,
-        "noplaylist": True,
+        "quiet": True, 
+        "noplaylist": True, 
         "geo_bypass": True,
-        # Re-enable spoofing for YouTube stability, now supported by curl-cffi
+        # Client spoofing + curl-cffi is crucial for TikTok/YT
         "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
     }
@@ -71,314 +63,305 @@ def get_yt_dlp_opts(filename=None):
              "outtmpl": filename,
              "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
         })
-    else:
-        opts["format"] = "best"
     return opts
-
-def _time_windows(total_duration_sec: float, duration: float, overlap: float) -> list[tuple[float, float]]:
-    """Generate (start, end) windows in seconds. End = start + duration; step = duration - overlap."""
-    if duration <= 0 or overlap < 0 or overlap >= duration:
-        raise ValueError("duration > 0, 0 <= overlap < duration")
-    step = duration - overlap
-    windows = []
-    start = 0.0
-    while start < total_duration_sec:
-        end = min(start + duration, total_duration_sec)
-        windows.append((start, end))
-        start += step
-        if start >= total_duration_sec:
-            break
-    return windows
-
-
-def _extract_segment(input_path: Path, output_path: Path, start_sec: float, duration_sec: float) -> None:
-    """Extract a segment of audio using ffmpeg."""
-    import subprocess
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", str(input_path),
-            "-ss", str(start_sec), "-t", str(duration_sec),
-            "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-            str(output_path),
-        ],
-        capture_output=True,
-        check=True,
-    )
-
-
 
 app = modal.App("treehacks-video-ingestor-v2", image=image)
 
-
-@app.function(
-    image=image,
-    volumes={CACHE_DIR: model_cache},
-    timeout=300,
-)
-def download_audio_to_volume(url: str, job_id: str) -> tuple[str, float]:
-    """Download audio from URL to the shared volume; return (audio_path, duration_sec)."""
-    import yt_dlp
-    audio_dir = Path(CACHE_DIR) / "audio"
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    out_path = audio_dir / f"{job_id}" # yt-dlp suffixes extension
-    
-    try:
-        # Use centralized options (includes client spoofing)
-        opts = get_yt_dlp_opts(filename=str(out_path))
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-            
-        final_path = out_path.with_suffix(".wav")
-        if not final_path.exists():
-            raise RuntimeError("Download did not produce WAV")
-    except Exception as e:
-        raise RuntimeError(f"Failed to download audio from {url}: {e}")
-        
-    result = __import__("subprocess").run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(final_path)],
-        capture_output=True, text=True, check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffprobe failed: {result.stderr}")
-    duration = float(result.stdout.strip())
-    model_cache.commit()
-    return (str(final_path), duration)
-
-
-# 2. Worker Class (CLIP for frames + text; Whisper for transcription)
+# 2. Worker Class (CLIP + Whisper)
 @app.cls(
     gpu="A10G",
-    scaledown_window=120,
+    scaledown_window=300, # Keep containers warm longer
     secrets=[modal.Secret.from_name("mongo")],
     volumes={CACHE_DIR: model_cache},
-    timeout=600,
-    max_containers=MAX_TRANSCRIPTION_CONTAINERS,
+    timeout=900, # 15 min timeout per segment
+    max_containers=MAX_CONTAINERS,
 )
 class VideoWorker:
     @modal.enter()
-    def load_model(self):
+    def setup(self):
         import torch
-        from transformers import CLIPProcessor, CLIPModel
-        import whisper
+        from transformers import CLIPProcessor, CLIPModel, pipeline, AutoModelForSpeechSeq2Seq, AutoProcessor
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"⚡ Loading CLIP ({MODEL_REPO}) on {self.device}...", flush=True)
+        print(f"⚡ Loading Models on {self.device}...", flush=True)
+        
+        # Load CLIP
         self.processor = CLIPProcessor.from_pretrained(MODEL_REPO, local_files_only=True)
         self.model = CLIPModel.from_pretrained(MODEL_REPO, local_files_only=True).to(self.device)
         self.model.eval()
-        print("⚡ Loading Whisper...", flush=True)
-        os.environ["XDG_CACHE_HOME"] = CACHE_DIR
-        model_cache.reload()
-        self.whisper_model = whisper.load_model(WHISPER_MODEL, download_root=CACHE_DIR)
-        print("✅ CLIP + Whisper ready.")
+        
+        # Load Whisper safely using HF Pipeline (More robust & faster on A10G)
+        model_id = "openai/whisper-base"
+        
+        whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id, 
+            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32, 
+            low_cpu_mem_usage=True, 
+            use_safetensors=True
+        ).to(self.device)
+        
+        whisper_processor = AutoProcessor.from_pretrained(model_id)
 
-    def _get_stream_url(self, url):
+        self.transcriber = pipeline(
+            "automatic-speech-recognition",
+            model=whisper_model,
+            tokenizer=whisper_processor.tokenizer,
+            feature_extractor=whisper_processor.feature_extractor,
+            chunk_length_s=30,
+            batch_size=8,  # Better throughput
+            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+            device=self.device,
+        )
+        print("✅ Models ready.")
+
+    def _get_stream_info(self, url):
+        """Returns (url, http_headers)"""
         import yt_dlp
-        # Use centralized options (includes client spoofing)
         opts = get_yt_dlp_opts()
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            return info['url']
+            return info.get('url'), info.get('http_headers', {})
 
     @modal.method()
-    def transcribe_segment(
-        self, audio_path: str, start_sec: float, end_sec: float
-    ) -> tuple[tuple[float, float], str]:
-        """Transcribe a single segment; returns ((start, end), text)."""
-        import tempfile
-        model_cache.reload()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            segment_path = Path(tmpdir) / "segment.wav"
-            _extract_segment(Path(audio_path), segment_path, start_sec, end_sec - start_sec)
-            result = self.whisper_model.transcribe(str(segment_path), fp16=True, language="en")
-            text = result.get("text", "").strip()
-        return ((start_sec, end_sec), text)
-
-    @modal.method()
-    def embed_transcriptions(
-        self, transcription_dict: dict[tuple[float, float], str]
-    ) -> dict[tuple[float, float], dict]:
-        """Embed each transcribed segment with same CLIP text encoder as frame embeddings."""
-        import torch
-        if not transcription_dict:
-            return {}
-        intervals = list(transcription_dict.keys())
-        texts = [transcription_dict[iv] or " " for iv in intervals]
-        inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True, max_length=77).to(self.device)
-        with torch.no_grad():
-            emb = self.model.get_text_features(**inputs)
-            emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
-        return {
-            iv: {"text": transcription_dict[iv], "embedding": v.tolist()}
-            for iv, v in zip(intervals, emb.cpu())
-        }
-
-    @modal.method()
-    def process_segment(
-        self,
-        video_url: str,
-        start: float,
-        end: float,
-        title: str,
-        transcription_embeddings: dict | None = None,
-        fps: int = 1,
-    ):
+    def process_segment_pipeline(self, video_url: str, start: float, end: float, title: str):
+        """
+        Runs Transcription AND Frame Embedding in parallel for this specific segment.
+        This provides near-realtime results as each segment finishes.
+        """
         import subprocess
         from PIL import Image
         import torch
-        
-        print(f"▶️ Segment {start}-{end}s: {title}", flush=True)
-        
+        import numpy as np
+        import tempfile
+
+        print(f"▶️ Processing Segment {start}-{end}s: {title}", flush=True)
+
         try:
-            stream_url = self._get_stream_url(video_url)
+            stream_url, headers = self._get_stream_info(video_url)
         except Exception as e:
-            print(f"❌ Failed to get stream for {video_url}. (Check cookies.txt): {e}")
+            print(f"❌ Stream extraction failed: {e}")
             return 0
 
-        # FFMPEG: Seek to specific time (-ss) and duration (-t)
-        cmd = [
-            "ffmpeg", 
-            "-ss", str(start),
-            "-t", str(end - start),
-            "-i", stream_url,
-            "-vf", f"fps={fps},scale=224:224",
-            "-f", "image2pipe",
-            "-pix_fmt", "rgb24",
-            "-vcodec", "rawvideo", 
-            "-loglevel", "error",
-            "-"
-        ]
+        # Build headers for FFMPEG (Critical for TikTok/Twitch)
+        headers_list = []
+        for k, v in headers.items():
+            headers_list.append(f"{k}: {v}")
+        headers_str = "\r\n".join(headers_list)
+        if headers_str:
+            headers_str += "\r\n"
 
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        frame_bytes = 224 * 224 * 3
+        # --- 1. Audio Transcription (On the fly) ---
+        transcription_text = ""
+        try:
+            # We use a directory to avoid file locking/existence issues with yt-dlp
+            with tempfile.TemporaryDirectory() as temp_dir:
+                audio_path = os.path.join(temp_dir, "audio.wav")
+                
+                # Use yt-dlp to download the audio segment directly
+                # This is more robust against 403s than ffmpeg -i URL because yt-dlp handles the session/cookies
+                cmd_audio = [
+                    "yt-dlp",
+                    "--quiet", "--no-warnings",
+                    "--download-sections", f"*{start}-{end}",
+                    "--force-keyframes-at-cuts",
+                    "--extract-audio",
+                    "--audio-format", "wav",
+                    "--audio-quality", "0",
+                    "--output", audio_path,
+                    video_url
+                ]
+                
+                # Add extractor args for spoofing if needed
+                cmd_audio.extend(["--extractor-args", "youtube:player_client=android,ios"])
+
+                try:
+                    subprocess.run(cmd_audio, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+                except subprocess.CalledProcessError as e:
+                    # If yt-dlp fails (e.g. no audio stream?), we catch it
+                    print(f"FAILED yt-dlp Audio Cmd: {' '.join(cmd_audio)}")
+                    print(f"Error output: {e.stderr.decode()}")
+                    raise e
+                
+                # Verify file exists (yt-dlp might add extension but we forced wav)
+                # simpler: just listdir and pick the first file
+                files = os.listdir(temp_dir)
+                if not files:
+                    raise FileNotFoundError("yt-dlp did not produce an audio file")
+                
+                final_audio_path = os.path.join(temp_dir, files[0])
+                
+                # Transcribe using pipeline
+                # We can load into memory or pass path
+                res = self.transcriber(
+                    final_audio_path, 
+                    batch_size=8,
+                    return_timestamps=True,
+                    generate_kwargs={"language": "en"}
+                )
+                transcription_text = res.get("text", "").strip() # type: ignore
+        except Exception as e:
+            print(f"⚠️ Audio failed for segment {start}s (skipping text): {e}", flush=True)
+
+        # Embed Transcription if exists
+        text_embedding = None
+        if transcription_text:
+            inputs = self.processor(text=[transcription_text], return_tensors="pt", padding=True, truncation=True).to(self.device)
+            with torch.no_grad():
+                emb = self.model.get_text_features(**inputs)
+                emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
+                text_embedding = emb.cpu().numpy()[0]
+
+        # --- 2. Frame Extraction & Embedding ---
+        # Use yt-dlp to download the video segment to a temp file, then process with ffmpeg
+        # This is more robust than streaming directly with ffmpeg
         
         frames = []
         timestamps = []
-        frame_idx = 0
+        
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                video_path = os.path.join(temp_dir, "video.mp4")
+                
+                cmd_video_dl = [
+                    "yt-dlp",
+                    "--quiet", "--no-warnings",
+                    "--download-sections", f"*{start}-{end}",
+                    "--force-keyframes-at-cuts",
+                    "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                    "--output", video_path,
+                    video_url
+                ]
+                # Spoofing args
+                cmd_video_dl.extend(["--extractor-args", "youtube:player_client=android,ios"])
+                
+                # Download segment
+                subprocess.run(cmd_video_dl, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+                
+                # Verify file
+                files = os.listdir(temp_dir)
+                if not files:
+                    print(f"⚠️ yt-dlp failed to download video segment {start}-{end}")
+                    return 0
+                
+                final_video_path = os.path.join(temp_dir, files[0])
 
-        while True:
-            raw = process.stdout.read(frame_bytes)
-            if len(raw) != frame_bytes: break
+                # Extract frames from the LOCAL file
+                cmd_ffmpeg = [
+                    "ffmpeg", 
+                    "-i", final_video_path,
+                    "-vf", "fps=1,scale=224:224", 
+                    "-f", "image2pipe",
+                    "-pix_fmt", "rgb24",
+                    "-vcodec", "rawvideo", 
+                    "-loglevel", "error",
+                    "-"
+                ]
+                
+                process = subprocess.Popen(cmd_ffmpeg, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                frame_bytes = 224 * 224 * 3
+                
+                frame_idx = 0
+                while True:
+                    raw = process.stdout.read(frame_bytes)
+                    if len(raw) != frame_bytes: break
+                    frames.append(Image.frombytes("RGB", (224, 224), raw))
+                    timestamps.append(start + frame_idx) 
+                    frame_idx += 1
+                
+                process.terminate()
+
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Video download/processing failed for {start}-{end}: {e.stderr.decode()}")
+            return 0
+        except Exception as e:
+            print(f"❌ Error in video pipeline: {e}")
+            return 0
             
-            image = Image.frombytes("RGB", (224, 224), raw)
-            frames.append(image)
-            timestamps.append(start + (frame_idx / fps))
-            frame_idx += 1
-
-        process.terminate()
-
         if not frames:
+            print(f"⚠️ No frames extracted for {start}-{end}s")
             return 0
 
-        # Batch Inference (image embeddings)
-        print(f"🧠 Embedding {len(frames)} frames...", flush=True)
+        # Batch Embed Images (rest of the code...)
         inputs = self.processor(images=frames, return_tensors="pt", padding=True).to(self.device)
         with torch.no_grad():
             img_emb = self.model.get_image_features(**inputs)
             img_emb = img_emb / img_emb.norm(p=2, dim=-1, keepdim=True)
-        img_emb = img_emb.cpu()
+        img_emb = img_emb.cpu().numpy()
 
-        # Merge transcription embeddings for each frame: for time t, average all window embeddings that contain t, then add to image embedding and renormalize
-        import numpy as np
-        transcription_embeddings = transcription_embeddings or {}
+        # Combine Image + Text (Late Fusion)
         results = []
         for i, t in enumerate(timestamps):
-            vec = img_emb[i].numpy()
-            if transcription_embeddings:
-                covering = [
-                    transcription_embeddings[iv]["embedding"]
-                    for iv in transcription_embeddings
-                    if iv[0] <= t < iv[1]
-                ]
-                if covering:
-                    avg_text = np.array(covering).mean(axis=0).astype(np.float32)
-                    avg_text = avg_text / (np.linalg.norm(avg_text) + 1e-9)
-                    vec = vec + avg_text
-                    vec = vec / (np.linalg.norm(vec) + 1e-9)
-            results.append({"time": t, "vector": vec.tolist(), "title": title, "source": video_url})
+            vec = img_emb[i]
+            # If we have text for this segment, add it to every frame in the segment
+            if text_embedding is not None:
+                vec = vec + text_embedding
+                vec = vec / (np.linalg.norm(vec) + 1e-9) # Renormalize
+            
+            results.append({
+                "time": t, 
+                "vector": vec.tolist(), 
+                "title": title, 
+                "source": video_url,
+                "text_context": transcription_text
+            })
 
+        # Upload
         self._push_results(results)
         return len(results)
 
     def _push_results(self, vectors):
         import requests
-        if not vectors: return
-        
         api_url = os.environ.get("VECTOR_API_URL")
-        api_key = os.environ.get("VECTOR_API_KEY")
-        
-        if not api_url:
-            print("⚠️ VECTOR_API_URL missing. Skipping upload.")
-            return
+        # Retry logic for robustness
+        for _ in range(3):
+            try:
+                if not api_url: return
+                resp = requests.post(
+                    api_url.rstrip("/") + "/frames/bulk", 
+                    json={"frames": vectors}, 
+                    headers={"X-API-Key": os.environ.get("VECTOR_API_KEY", "")},
+                    timeout=30
+                )
+                if resp.status_code == 200: break
+            except:
+                continue
 
-        try:
-            # Modified to use /frames/bulk for flexibility
-            url = api_url.rstrip("/") + "/frames/bulk"
-            headers = {"Content-Type": "application/json"}
-            if api_key:
-                headers["X-API-Key"] = api_key
-
-            resp = requests.post(
-                url, 
-                json={"frames": vectors}, 
-                headers=headers,
-                timeout=60
-            )
-            resp.raise_for_status()
-        except Exception as e:
-            print(f"❌ Upload failed: {e}")
-
-# 3. Orchestrator (single Modal call: download audio → transcribe → embed → frame+merge)
+# 3. Orchestrator
 @app.function(image=image)
 def ingest_video_orchestrator(url: str):
     import yt_dlp
+    import math
 
     print(f"🔎 Analyzing {url}...")
     try:
-        # Use centralized options (includes client spoofing)
         with yt_dlp.YoutubeDL(get_yt_dlp_opts()) as ydl:
             info = ydl.extract_info(url, download=False)
             duration = info.get("duration")
             title = info.get("title", "Unknown")
             if not duration:
-                print(f"❌ Could not determine duration for {url}")
-                return
+                print("⚠️ No duration found. Defaulting to 60s check.")
+                duration = 60
     except Exception as e:
-        print(f"❌ Metadata fetch failed: {e}")
+        print(f"❌ Metadata failed: {e}")
         return
 
     print(f"🎞️ Title: {title} | Duration: {duration}s")
 
-    # Download audio once for transcription
-    job_id = str(uuid.uuid4())
-    print("⬇️ Downloading audio for transcription...")
-    audio_path, _ = download_audio_to_volume.remote(url, job_id)
-    windows = _time_windows(duration, WINDOW_DURATION, WINDOW_OVERLAP)
-    print(f"🎤 Transcribing {len(windows)} windows...")
-    worker = VideoWorker()
-    segment_args = [(audio_path, s, e) for s, e in windows]
-    transcription_results = list(worker.transcribe_segment.starmap(segment_args))
-    transcription_dict = dict(transcription_results)
-    print("📐 Embedding transcriptions with CLIP (same as frames)...")
-    with_embeddings = worker.embed_transcriptions.remote(transcription_dict)
-
-    # Video segments: each gets (url, start, end, title, with_embeddings)
+    # Generate parallel tasks immediately
     segments = []
+    # Overlap segments slightly (by 1s) to ensure continuity
     for t in range(0, int(duration), SEGMENT_DURATION):
-        end = min(t + SEGMENT_DURATION, duration)
-        segments.append((url, float(t), end, title, with_embeddings))
+        end = min(t + SEGMENT_DURATION + 1, duration) 
+        segments.append((url, float(t), end, title))
 
-    print(f"🚀 Launching {len(segments)} parallel workers (frames + merged transcription)...")
-    results = list(worker.process_segment.starmap(segments))
-    total_frames = sum(results)
-    print(f"✅ Completed {title}: Processed {total_frames} frames.")
+    print(f"🚀 Launching {len(segments)} parallel workers...")
+    
+    # Run in parallel
+    worker = VideoWorker()
+    list(worker.process_segment_pipeline.starmap(segments))
+    
+    print("✅ Ingestion Complete.")
 
 @app.local_entrypoint()
 def main():
-    urls = [
-        "https://www.twitch.tv/videos/2689445480"
-    ]
-    
-    for url in urls:
-        ingest_video_orchestrator.remote(url)
+    ingest_video_orchestrator.remote("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
