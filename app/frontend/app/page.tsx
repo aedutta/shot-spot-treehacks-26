@@ -42,7 +42,7 @@ function embedUrlForSource(sourceUrl: string, startSeconds: number): string | nu
   return null;
 }
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
 function getThumbnailUrl(sourceUrl: string): string | null {
   try {
