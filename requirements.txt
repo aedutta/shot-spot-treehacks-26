@@ -5,4 +5,3 @@ certifi>=2024.0.0
 fastapi>=0.100.0
 uvicorn[standard]>=0.22.0
 modal
-sentence-transformers>=2.2.0
