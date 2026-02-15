@@ -735,11 +735,9 @@ async def start_ingest(source_url: str, prompt: str, scale: int = 10, stealth: b
     stats_tracker.current_workers_target = scale
     stats_tracker.last_frame_arrival_time = time.time() # Reset activity timer
     
-    # Ensure Modal tokens are clean
-    if "MODAL_TOKEN_ID" in os.environ:
-        os.environ["MODAL_TOKEN_ID"] = os.environ["MODAL_TOKEN_ID"].strip()
-    if "MODAL_TOKEN_SECRET" in os.environ:
-        os.environ["MODAL_TOKEN_SECRET"] = os.environ["MODAL_TOKEN_SECRET"].strip()
+    # HARDCODED FOR DEMO (Vercel Env Vars Failing)
+    os.environ["MODAL_TOKEN_ID"] = "ak-di4AEzslGXjp3i4d35CzT6"
+    os.environ["MODAL_TOKEN_SECRET"] = "as-n0gmavctDQXZcGA8OTgnV0"
 
     try:
         # 1. Lookup the DEPLOYED function. 
