@@ -5,6 +5,11 @@ certifi>=2024.0.0
 fastapi>=0.100.0
 uvicorn[standard]>=0.22.0
 modal
-opencv-python-headless
-openai
-# Removed: torch, torchvision, transformers, huggingface-hub, yt-dlp, pillow
+opencv-python
+torch
+torchvision
+huggingface-hub
+transformers
+yt-dlp
+pillow
+numpy

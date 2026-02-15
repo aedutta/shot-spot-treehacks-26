@@ -56,42 +56,41 @@ try:
     from transformers import CLIPProcessor, CLIPModel
     import torch
     print("Loading CLIP (Text Encoder - LAION-2B)...")
-    # Using LAION-2B (English) - Drop-in replacement for OpenAI ViT-B/32 (512 dim)
     model_id = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
     processor = CLIPProcessor.from_pretrained(model_id)
     model = CLIPModel.from_pretrained(model_id)
     print("CLIP Loaded.")
 except ImportError:
-    print("Warning: transformers/torch not installed. Text search will fail.")
+    print("Warning: transformers/torch not installed. Functionality will use remote Modal fallback.")
     processor = None
     model = None
 
 def embed_text(text: str) -> List[float]:
-    if not model:
-        raise HTTPException(500, "CLIP model not loaded")
-    inputs = processor(text=[text], return_tensors="pt", padding=True)
-    with torch.no_grad():
-        # Get the text features
-        # Note: In some versions of transformers, we might need to call model.get_text_features
-        # Use simple model call if get_text_features is behaving unexpectedly, but get_text_features returns a Tensor.
-        
-        try:
+    if model:
+        # Local inference
+        inputs = processor(text=[text], return_tensors="pt", padding=True, truncation=True)
+        with torch.no_grad():
             text_features = model.get_text_features(**inputs)
-        except Exception:
-            # Fallback if get_text_features is effectively missing or behaving oddly (unlikely for CLIPModel but good for safety)
-            outputs = model.text_model(**inputs)
-            text_features = outputs.pooler_output
-            
-        # Ensure it's a tensor before normalization
-        if hasattr(text_features, 'pooler_output'):
-             text_features = text_features.pooler_output
-
-        # Normalize
-        text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
-    
-    vec = text_features[0].tolist()
-    print(f"🔎 DEBUG: Generated embedding dimension: {len(vec)}")
-    return vec
+            # normalize
+            text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
+        return text_features[0].tolist()
+    else:
+        # Remote inference via Modal
+        try:
+            # Import dynamically to avoid top-level issues
+            from embedder import embed_text as remote_embed
+            print(f"Invoking Modal for text embedding: '{text[:20]}...'")
+            # remote_embed.remote() calls the function on Modal
+            result = remote_embed.remote(text)
+            # The result from modal might come back as list or numpy array depending on definition
+            # Our definition returns a list
+            return result
+        except ImportError:
+             print("Error: Could not import 'embedder'. Ensure modal_infra is accessible.")
+             raise HTTPException(status_code=500, detail="Search unavailable: Backend misconfigured (missing embedder).")
+        except Exception as e:
+            print(f"Error invoking Modal embedder: {e}")
+            raise HTTPException(status_code=500, detail=f"Search failed: Remote embedding error ({str(e)})")
 
 app = FastAPI(
     title="ShotSpot API",
@@ -116,6 +115,7 @@ class ScrapeRequest(BaseModel):
 class CreateDatasetRequest(BaseModel):
     prompt: str
     urls: List[str]
+    scale: int = 10
 
 class FrameUpload(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -385,6 +385,8 @@ def scrape_endpoint(request: ScrapeRequest):
 @app.post("/dataset/create")
 async def create_dataset_endpoint(request: CreateDatasetRequest):
     print(f"Dataset Creation Request: '{request.prompt}'")
+    stats_tracker.current_workers_target = request.scale
+    stats_tracker.last_frame_arrival_time = time.time()
     
     # 1. Determine Source URLs
     urls = request.urls

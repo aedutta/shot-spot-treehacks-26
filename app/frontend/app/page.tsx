@@ -42,6 +42,8 @@ function embedUrlForSource(sourceUrl: string, startSeconds: number): string | nu
   return null;
 }
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 function getThumbnailUrl(sourceUrl: string): string | null {
   try {
      if (sourceUrl.includes("youtube.com") || sourceUrl.includes("youtu.be")) {
@@ -200,6 +202,8 @@ export default function Dashboard() {
   };
 
   const handleImportDataset = async () => {
+    // Maximize resources for batch processing
+    setScale(100);
     setIsImporting(true);
     setDatasetFrames([]);
     setScrapeResults(null); 
@@ -219,9 +223,10 @@ export default function Dashboard() {
 
       setLogs(prev => [...prev, `[INFO] Starting Import Job: "${importPrompt}" [${importedUrls.length} Sources]...`]);
 
-      const res = await axios.post("http://localhost:8000/dataset/create", {
+      const res = await axios.post(`${API_BASE}/dataset/create`, {
         prompt: importPrompt,
         urls: importedUrls,
+        scale: 100,
       });
 
       setScrapeResults(res.data);
@@ -250,12 +255,16 @@ export default function Dashboard() {
 
   const fetchDatasetFrames = async () => {
     try {
+      // Use the prompt corresponding to the active tab
+      let currentPrompt = activeTab === "create" ? createPrompt : importPrompt;
+      if (!currentPrompt) return; // Don't fetch if no prompt
+      
       // Get URLs that are actually being processed (Twitch links in this demo)
       // or just all discovered URLs
-      const targetUrls = scrapeResults?.jobs?.map((j: any) => j.url) || [];
+      const targetUrls = scrapeResults?.jobs?.map((j: any) => j.url) || (activeTab === "import" ? importedUrls : []) || [];
 
-      const res = await axios.post("http://localhost:8000/search", {
-          query: createPrompt,
+      const res = await axios.post(`${API_BASE}/search`, {
+          query: currentPrompt,
           top_k: 24,
           allowed_sources: targetUrls.length > 0 ? targetUrls : undefined
       });
@@ -268,10 +277,17 @@ export default function Dashboard() {
   };
 
   useEffect(() => {
-    if (!isMonitoringDataset || !createPrompt) return;
+    const currentPrompt = activeTab === "create" ? createPrompt : importPrompt;
+    
+    // Only fetch if monitoring is active AND we have a prompt
+    if (!isMonitoringDataset || !currentPrompt) return;
+    
+    // Initial fetch
+    fetchDatasetFrames();
+    
     const interval = setInterval(() => fetchDatasetFrames(), 4000);
     return () => clearInterval(interval);
-  }, [isMonitoringDataset, createPrompt]);
+  }, [isMonitoringDataset, createPrompt, importPrompt, activeTab]);
 
   const handleCreateDataset = async () => {
     setIsScraping(true);
@@ -289,7 +305,7 @@ export default function Dashboard() {
 
       addLog(`Starting Dataset Job: "${createPrompt}" [${validUrls.length > 0 ? validUrls.length + ' Sources' : 'Auto-Discovery'}]...`);
 
-      const res = await axios.post("http://localhost:8000/dataset/create", {
+      const res = await axios.post(`${API_BASE}/dataset/create`, {
         prompt: createPrompt,
         urls: validUrls,
       });
@@ -320,7 +336,7 @@ export default function Dashboard() {
     const interval = setInterval(async () => {
       // Fetch stats from backend
       try {
-        const res = await axios.get("http://localhost:8000/stats");
+        const res = await axios.get(`${API_BASE}/stats`);
         if (res.data) {
            setStats({
              active_workers: res.data.active_workers || 0,
@@ -331,7 +347,7 @@ export default function Dashboard() {
 
         // Poll Ingestion Progress if URL is set
         if (url) {
-             const statusRes = await axios.get(`http://localhost:8000/ingestion/status?url=${encodeURIComponent(url)}`);
+             const statusRes = await axios.get(`${API_BASE}/ingestion/status?url=${encodeURIComponent(url)}`);
              if (statusRes.data.status !== "not_found") {
                 setIngestionProgress({
                   current: statusRes.data.processed_segments,
@@ -386,7 +402,7 @@ export default function Dashboard() {
     
     try {
         // Call the backend API
-        const res = await axios.post("http://localhost:8000/ingest/start", null, {
+        const res = await axios.post(`${API_BASE}/ingest/start`, null, {
             params: {
               source_url: url || "https://www.twitch.tv/videos/2689445480", // Default from modal file
               prompt: prompt,
@@ -406,7 +422,7 @@ export default function Dashboard() {
               try {
                 // Poll for at least one result
                 const payload = { query: prompt, top_k: 1, source_url: url || undefined };
-                const checkRes = await axios.post("http://localhost:8000/search", payload);
+                const checkRes = await axios.post(`${API_BASE}/search`, payload);
                 if (checkRes.data.ok && checkRes.data.results.length > 0) {
                     clearInterval(checkDataInterval);
                     addLog(`🚀 DATA STREAM ACTIVE - STARTING VISUALIZATION`);
@@ -446,7 +462,7 @@ export default function Dashboard() {
          source_url: url || undefined
       };
       
-      const res = await axios.post("http://localhost:8000/search", payload);
+      const res = await axios.post(`${API_BASE}/search`, payload);
       if (res.data.ok) {
         const results = res.data.results as Array<{ timestamp_seconds?: number; [k: string]: unknown }>;
         if (results.length === 0) {
@@ -462,7 +478,7 @@ export default function Dashboard() {
         const videoLength = Math.max(...times, 0) + 120;
         
         try {
-          const groupRes = await axios.post("http://localhost:8000/timestamps/group", {
+          const groupRes = await axios.post(`${API_BASE}/timestamps/group`, {
              times,
              video_length: videoLength,
           });
@@ -508,11 +524,12 @@ export default function Dashboard() {
              };
           });
 
-          // Dedupe by ID just in case
+          // Dedupe by timestamp just in case
           const seen = new Set();
           const unique = consolidatedFrames.filter(f => {
-              if (seen.has(f.id)) return false;
-              seen.add(f.id);
+              const key = `${f.title}-${f.timestamp_seconds}`;
+              if (seen.has(key)) return false;
+              seen.add(key);
               return true;
           });
 
@@ -668,7 +685,7 @@ export default function Dashboard() {
                                 <h2 className="text-sm font-bold uppercase text-zinc-400">Job Status</h2>
                                 <button 
                                     onClick={() => {
-                                        window.open(`http://localhost:8000/dataset/export?query=${encodeURIComponent(createPrompt)}`, '_blank');
+                                        window.open(`${API_BASE}/dataset/export?query=${encodeURIComponent(createPrompt)}`, '_blank');
                                     }}
                                     className="text-xs bg-neon-green/10 border border-neon-green hover:bg-neon-green/20 text-neon-green px-3 py-1.5 rounded font-bold flex items-center gap-2 transition-colors"
                                 >
@@ -1042,6 +1059,73 @@ export default function Dashboard() {
                              </div>
                         </div>
                     )}
+
+                 {/* GLOBAL VIDEO OVERLAY FOR IMPORT TAB */}
+                 <AnimatePresence>
+                  {pipFrame && (
+                    <motion.div
+                      initial={{ opacity: 0, scale: 0.95 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.95 }}
+                      transition={{ duration: 0.2 }}
+                      className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-black/80 backdrop-blur-md"
+                      onClick={() => setPipFrame(null)}
+                    >
+                      <div
+                        className="relative w-full max-w-5xl aspect-video rounded-xl overflow-hidden border-2 border-neon-green/50 bg-black shadow-2xl shadow-neon-green/20"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setPipFrame(null)}
+                          className="absolute top-4 right-4 z-30 w-10 h-10 rounded-full bg-black/80 border border-zinc-600 flex items-center justify-center text-white hover:bg-red-500 hover:border-red-500 transition-colors"
+                          aria-label="Close video"
+                        >
+                          <X size={20} />
+                        </button>
+                        <div className="absolute top-4 left-4 z-30 px-3 py-1.5 rounded bg-black/80 text-xs text-neon-green font-mono border border-neon-green/30 truncate max-w-[80%] flex items-center gap-2">
+                          <Play size={12} fill="currentColor" />
+                          <span className="font-bold">{pipFrame.title}</span> 
+                          <span className="text-zinc-500">|</span> 
+                          <span className="text-white">{pipFrame.timestamp_seconds != null ? `${Math.floor(pipFrame.timestamp_seconds / 60)}m ${pipFrame.timestamp_seconds % 60}s` : ""}</span>
+                        </div>
+                        
+                        {embedUrlForSource(pipFrame.source_url, pipFrame.timestamp_seconds ?? 0) ? (
+                          <iframe
+                            src={(embedUrlForSource(pipFrame.source_url, pipFrame.timestamp_seconds ?? 0) ?? "") + "&autoplay=1"}
+                            title={pipFrame.title}
+                            className="w-full h-full"
+                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                            allowFullScreen
+                          />
+                        ) : (
+                          <div className="w-full h-full flex flex-col items-center justify-center gap-4 text-zinc-400 p-8 bg-zinc-900/50">
+                            <Video size={64} className="text-zinc-600" />
+                            <div className="text-center space-y-1">
+                                <h3 className="text-lg font-bold text-white">Playback Unavailable</h3>
+                                <p className="text-sm">This source cannot be embedded directly.</p>
+                            </div>
+                            <a
+                              href={pipFrame.source_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="bg-neon-green text-black px-6 py-2 rounded font-bold hover:bg-white hover:shadow-lg transition-all flex items-center gap-2"
+                            >
+                              Open in New Tab <Globe size={16} />
+                            </a>
+                            <button
+                              type="button"
+                              onClick={() => setPipFrame(null)}
+                              className="text-zinc-500 hover:text-white text-xs underline underline-offset-4"
+                            >
+                              Close Overlay
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </motion.div>
+                  )}
+                 </AnimatePresence>
              </div>
           ) : (
         <div className="flex h-full w-full p-4 gap-4">
