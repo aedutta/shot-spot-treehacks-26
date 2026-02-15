@@ -2,7 +2,7 @@
 
 ![ShotSpot Demo](example.png)
 
-![Generative Dataset Construction](generate.png)
+![Generative Dataset Construction](poster.png)
 
 ## Inspiration
 
