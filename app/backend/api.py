@@ -110,7 +110,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Request/Response models ---
+# --- Request/Response models 
 
 class ScrapeRequest(BaseModel):
     urls: List[str]
