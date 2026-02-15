@@ -1,15 +1,12 @@
 pymongo>=4.6.0
 numpy>=1.24.0
 python-dotenv>=1.0.0
-certifi>=2024.0.0
+certifi
 fastapi>=0.100.0
-uvicorn[standard]>=0.22.0
+requests
+# Removed heavy/unused libs for Vercel
 modal
-opencv-python
-torch
-torchvision
-huggingface-hub
-transformers
-yt-dlp
-pillow
-numpy
+# uvicorn is provided by Vercel runtime or unnecessary 
+# opencv-python-headless
+# openai
+# Removed: torch, torchvision, transformers, huggingface-hub, yt-dlp, pillow
