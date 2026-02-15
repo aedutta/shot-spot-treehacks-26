@@ -29,6 +29,7 @@ const generateChartData = () => {
 export default function Dashboard() {
   // --- State ---
   const [prompt, setPrompt] = useState("");
+  const [url, setUrl] = useState("");
   const [source, setSource] = useState("Youtube");
   const [scale, setScale] = useState(10);
   const [stealth, setStealth] = useState(false);
@@ -82,9 +83,31 @@ export default function Dashboard() {
   const handleStart = async () => {
     setIsIngesting(true);
     addLog(`INITIALIZING CLUSTER...`);
-    addLog(`Source: ${source} | Target: "${prompt}"`);
+    addLog(`Source: ${source} | URL: ${url || "Default"} | Target: "${prompt}"`);
     addLog(`Scaling to ${scale} workers on A10G GPUs...`);
     if (stealth) addLog(`[STEALTH] Bright Data Resi-Proxies ENGAGED 🥷`);
+    
+    try {
+        // Call the backend API
+        const res = await axios.post("http://localhost:8000/ingest/start", null, {
+            params: {
+              source_url: url || "https://www.twitch.tv/videos/2689445480", // Default from modal file
+              prompt: prompt,
+              scale: scale,
+              stealth: stealth
+            }
+        });
+
+        if (res.data.ok) {
+           addLog(`✅ SUCCESS: ${res.data.message}`);
+           addLog(`🆔 JOB ID: ${res.data.job_id}`);
+        } else {
+           addLog(`⚠️ WARNING: ${res.data.message}`);
+        }
+
+    } catch (e: any) {
+        addLog(`❌ ERROR: ${e.response?.data?.message || e.message}`);
+    }
     
     // Simulate finding frames
     setTimeout(() => {
@@ -152,6 +175,19 @@ export default function Dashboard() {
                   value={prompt}
                   onChange={(e) => setPrompt(e.target.value)}
                   placeholder="e.g. 'Red Bull Cans', 'Specific Dance'"
+                  className="w-full bg-zinc-900 border border-zinc-800 rounded-lg py-2 pl-10 pr-4 text-sm text-white focus:outline-none focus:border-neon-green transition-colors"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs text-zinc-500 uppercase font-bold">Target Video URL</label>
+              <div className="relative">
+                <Video className="absolute left-3 top-2.5 text-zinc-500" size={16} />
+                <input 
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  placeholder="e.g. YouTube / Twitch URL"
                   className="w-full bg-zinc-900 border border-zinc-800 rounded-lg py-2 pl-10 pr-4 text-sm text-white focus:outline-none focus:border-neon-green transition-colors"
                 />
               </div>
@@ -328,23 +364,42 @@ export default function Dashboard() {
                 <span className="text-xs">No samples yet. Start ingestion.</span>
              </div>
            ) : (
-             <div className="grid grid-cols-2 gap-3">
+             <div className="grid grid-cols-1 gap-3">
                {frames.map((frame, i) => (
-                 <motion.div 
+                 <motion.a 
+                    href={frame.source_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
                     key={i} 
-                    className="group relative aspect-video bg-zinc-900 border border-zinc-800 rounded overflow-hidden hover:border-neon-green transition-colors cursor-pointer"
+                    className="group relative aspect-video bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden hover:border-neon-green transition-all cursor-pointer block"
                   >
-                    <img src={frame.url} className="w-full h-full object-cover opacity-60 group-hover:opacity-100 transition-opacity" />
+                    {/* Placeholder or Thumbnail - For Twitch/YT we rely on the placeholder for now unless we fetch real thumbs */}
+                    <img src={frame.url} className="w-full h-full object-cover opacity-60 group-hover:opacity-80 transition-opacity" />
                     
-                    <div className="absolute inset-x-0 bottom-0 bg-black/80 backdrop-blur-sm p-2 transform translate-y-full group-hover:translate-y-0 transition-transform">
-                       <div className="flex justify-between items-center text-[10px]">
-                          <span className="text-neon-green font-mono">{(parseFloat(frame.score) * 100).toFixed(1)}%</span>
-                          <span className="text-zinc-400">{frame.timestamp}</span>
+                    {/* Play Button Overlay */}
+                    <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                        <div className="w-10 h-10 bg-neon-green/90 rounded-full flex items-center justify-center shadow-lg shadow-neon-green/20 backdrop-blur-sm">
+                            <Play size={18} className="text-black ml-1" fill="currentColor" />
+                        </div>
+                    </div>
+
+                    <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black via-black/90 to-transparent p-3 pt-8">
+                       <div className="flex justify-between items-end">
+                          <div className="flex flex-col gap-0.5">
+                             <div className="flex items-center gap-1.5 text-[10px] text-neon-green font-mono font-bold">
+                                <Activity size={10} />
+                                {(parseFloat(frame.score) * 100).toFixed(1)}% MATCH
+                             </div>
+                             <div className="text-xs text-white font-bold truncate max-w-[120px]">{frame.title}</div>
+                          </div>
+                          <span className="text-[10px] bg-zinc-800 text-zinc-300 px-1.5 py-0.5 rounded border border-zinc-700 font-mono">
+                            {frame.timestamp}
+                          </span>
                        </div>
                     </div>
-                 </motion.div>
+                 </motion.a>
                ))}
              </div>
            )}
