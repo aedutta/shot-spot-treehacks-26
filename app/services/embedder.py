@@ -48,7 +48,7 @@ class EmbedderService:
             return emb.cpu().numpy()[0].tolist()
 
 @app.local_entrypoint()
-def main(text: str = "test query"):
+def main(text: str):
     service = EmbedderService()
     print(f"Embedding '{text}'...")
     vector = service.embed_text.remote(text)
