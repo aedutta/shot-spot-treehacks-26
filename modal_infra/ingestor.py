@@ -4,16 +4,16 @@ import uuid
 from pathlib import Path
 
 # Configuration
-CACHE_DIR = "/data"  # Shared Volume
-MODEL_REPO = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
+CACHE_DIR = os.getenv("CACHE_DIR", "/data")  # Shared Volume
+MODEL_REPO = os.getenv("MODEL_REPO", "laion/CLIP-ViT-B-32-laion2B-s34B-b79K")
 # Reduce segment duration to increase parallelism. 
 # 15s segments = 4x more workers per video minute compared to 60s.
-SEGMENT_DURATION = 15 
+SEGMENT_DURATION = int(os.getenv("SEGMENT_DURATION", "15"))
 
 # Transcription
-WHISPER_MODEL = "base"
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 # Increase max containers to allow massive parallelism
-MAX_CONTAINERS = 100
+MAX_CONTAINERS = int(os.getenv("MAX_CONTAINERS", "100"))
 
 # 1. Define Image
 def download_model_build_step():
@@ -362,5 +362,9 @@ def ingest_video_orchestrator(url: str):
     print("✅ Ingestion Complete.")
 
 @app.local_entrypoint()
-def main():
-    ingest_video_orchestrator.remote("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+def main(url: str):
+    """
+    Run the ingestion pipeline on a video URL.
+    Usage: modal run modal_infra/ingestor.py --url <video_url>
+    """
+    ingest_video_orchestrator.remote(url)
