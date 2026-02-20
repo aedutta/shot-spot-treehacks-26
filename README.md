@@ -4,6 +4,13 @@
 
 ![Generative Dataset Construction](poster.png)
 
+## 🏆 Awards
+
+- 🥈 **Runner-Up – Modal Inference Track**  
+  *$1,000 in credits + AirPods*
+
+- 🥉 **3rd Place – Bright Data Best AI-Powered Web Data Track**  
+  *$250 cash + $500 credits*
 ## Inspiration
 
 Training computer vision models shouldn't require thousands of hours manually scrubbing through video footage. When we started building AI models for sports analytics, we discovered that **data collection and cleaning consumed 70-80% of our development time**, the true bottleneck in deploying real-world AI solutions. A researcher looking for "Steph Curry three-pointers" would need to watch hundreds of hours of game footage, manually looking through marked timestamps frame by frame.
