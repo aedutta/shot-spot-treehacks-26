@@ -288,6 +288,25 @@ class VideoWorker:
         self._push_results(results)
         return len(results)
 
+    @modal.method()
+    def embed_text(self, text: str):
+        """Embed a search query with the same CLIP tower used for ingestion.
+
+        Queries must land in the same vector space as the frame embeddings, so
+        reusing this worker's already-loaded model is both cheaper and safer
+        than standing up a second GPU app that could drift to another
+        checkpoint.
+        """
+        import torch
+
+        inputs = self.processor(
+            text=[text], return_tensors="pt", padding=True, truncation=True
+        ).to(self.device)
+        with torch.no_grad():
+            emb = self.model.get_text_features(**inputs)
+            emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
+        return emb.cpu().numpy()[0].tolist()
+
     def _push_results(self, vectors):
         import requests
         api_url = os.environ.get("VECTOR_API_URL")
