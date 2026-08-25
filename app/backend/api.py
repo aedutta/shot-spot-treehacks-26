@@ -75,19 +75,34 @@ def embed_text(text: str) -> List[float]:
             text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
         return text_features[0].tolist()
     else:
-        # Remote inference via Modal
+        # Remote inference via Modal.
+        #
+        # Reuse the ingestor's VideoWorker, which already has CLIP loaded on GPU
+        # for frame embedding. Queries have to land in the same vector space as
+        # the indexed frames, so sharing one model is both cheaper and safer
+        # than running a second GPU app that could drift to another checkpoint.
+        #
+        # Resolved by name rather than imported, so this serverless handler does
+        # not need modal_infra (or torch) bundled alongside it. The old
+        # `from embedder import embed_text` could never work: embedder.py
+        # defines embed_text as a method on a class, not at module level, so it
+        # always raised ImportError and surfaced as "missing embedder".
         try:
-            # Import dynamically to avoid top-level issues
-            from embedder import embed_text as remote_embed
             print(f"Invoking Modal for text embedding: '{text[:20]}...'")
-            # remote_embed.remote() calls the function on Modal
-            result = remote_embed.remote(text)
-            # The result from modal might come back as list or numpy array depending on definition
-            # Our definition returns a list
-            return result
-        except ImportError:
-             print("Error: Could not import 'embedder'. Ensure modal_infra is accessible.")
-             raise HTTPException(status_code=500, detail="Search unavailable: Backend misconfigured (missing embedder).")
+            Worker = modal.Cls.from_name("treehacks-video-ingestor-v2", "VideoWorker")
+            return Worker().embed_text.remote(text)
+        except modal.exception.NotFoundError:
+            print("Error: Modal app 'treehacks-video-ingestor-v2' is not deployed.")
+            raise HTTPException(
+                status_code=503,
+                detail="Search unavailable: embedding service not deployed. Run `modal deploy modal_infra/ingestor.py`.",
+            )
+        except modal.exception.AuthError:
+            print("Error: Modal credentials missing or invalid.")
+            raise HTTPException(
+                status_code=503,
+                detail="Search unavailable: Modal credentials missing. Set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET.",
+            )
         except Exception as e:
             print(f"Error invoking Modal embedder: {e}")
             raise HTTPException(status_code=500, detail=f"Search failed: Remote embedding error ({str(e)})")
